@@ -1,0 +1,25 @@
+# 天玑 TIANJI · Docker Compose
+#
+#   docker compose run --rm tianji gates      # 跑门禁
+#   docker compose run --rm tianji test       # 跑测试
+#   docker compose run --rm tianji train      # 训练（产物落在 ./runs）
+#   docker compose run --rm tianji generate   # 推理
+
+services:
+  tianji:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: tianji:latest
+    # 挂载本地 runs/ 目录，让训练产物在宿主机可见
+    volumes:
+      - ./runs:/app/runs
+      - ./data:/app/data:ro
+    environment:
+      PYTHONUNBUFFERED: "1"
+      PYTHONPATH: /app
+      OMP_NUM_THREADS: "4"
+    # 限制资源：本项目是纯 CPU 实现，不需要太多
+    mem_limit: 2g
+    cpus: 4.0
+    command: ["gates"]

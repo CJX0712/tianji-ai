@@ -1,0 +1,41 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tianji"
+version = "1.0.0"
+description = "天玑 TIANJI · 混合架构语言模型全栈（Gated DeltaNet x MLA x MoE x Muon2）"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "Apache-2.0" }
+authors = [{ name = "晨星 (Chenxing)" }]
+keywords = ["llm", "mixture-of-experts", "mamba", "linear-attention", "transformer", "numpy"]
+classifiers = [
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Intended Audience :: Science/Research",
+]
+dependencies = [
+    "numpy>=1.24",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+    "pytest-cov>=4.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/CJX0712/tianji-ai"
+Repository = "https://github.com/CJX0712/tianji-ai"
+Issues = "https://github.com/CJX0712/tianji-ai/issues"
+
+[tool.setuptools]
+packages = ["tianji"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q --no-header"
+filterwarnings = ["ignore::DeprecationWarning"]

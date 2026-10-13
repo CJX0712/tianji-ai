@@ -44,8 +44,10 @@ from .l9_align import (
     seq_logprob, mean_logprob, grad_logprob, Aligner, freeze_copy,
     dpo_terms, ipo_terms, simpo_terms, kto_terms,
 )
+from .data import TINY_TALE, default_corpus, markov_tokens
 from .l10_microops import MICROOPS, FAMILIES, FAMILY_KIND, run_all as run_microops
 from .model import TianjiConfig, TianjiModel, init_params, build_layer_layout
+from .persist import save_checkpoint, load_checkpoint, checkpoint_info, CheckpointError
 from .verify import run_all_gates, GateReport, GateResult
 
 __version__ = "1.0.0"
@@ -79,6 +81,9 @@ __all__ = [
     "dpo_terms", "ipo_terms", "simpo_terms", "kto_terms",
     # L10
     "MICROOPS", "FAMILIES", "FAMILY_KIND", "run_microops",
+    # 数据与持久化
+    "TINY_TALE", "default_corpus", "markov_tokens",
+    "save_checkpoint", "load_checkpoint", "checkpoint_info", "CheckpointError",
     # 模型与门禁
     "TianjiConfig", "TianjiModel", "init_params", "build_layer_layout",
     "run_all_gates", "GateReport", "GateResult",

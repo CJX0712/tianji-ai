@@ -7,3 +7,6 @@ venv/
 bench/results/*
 !bench/results/bench.json
 .DS_Store
+runs/
+*.npz
+*.npz.meta.json

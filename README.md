@@ -3,187 +3,465 @@
 > **Gated DeltaNet × MLA × MoE × Muon2 × 投机解码**
 > 零重写 · 集大成 · 闭环交付 · 可证门禁
 >
-> 作者：**晨星（Chenxing）** · 许可证：Apache-2.0
+> 作者：**晨星（Chenxing）** · 许可证：Apache-2.0 · 仓库：<https://github.com/CJX0712/tianji-ai>
+
+---
+
+## 目录
+
+- [这是什么](#这是什么)
+- [技术选型：为什么是这些方案](#技术选型为什么是这些方案)
+- [架构说明](#架构说明)
+- [快速开始](#快速开始)
+- [复现步骤](#复现步骤)
+- [性能对比数据](#性能对比数据)
+- [引用来源清单](#引用来源清单)
+- [仓库结构](#仓库结构)
+- [已知边界（不掩饰）](#已知边界不掩饰)
+- [许可证与署名](#许可证与署名)
 
 ---
 
 ## 这是什么
 
-一个**十层架构**的语言模型全栈，从数值内核到偏好对齐，每一层都站在世界顶级公开成果之上。
+一个**十层架构**的语言模型全栈，从数值内核到偏好对齐，每层都站在世界顶级公开成果之上。
 它不追求"从零发明"，而是把 2026 年已被工业界验证的最优解**正确地组合起来**，
 并用**可复现的基准数据**与**可证门禁**证明它真的能用。
 
 核心架构是 **3:1 混合**：每 4 层里 3 层 Gated DeltaNet（线性）、1 层 MLA（全注意力）。
 这是 Qwen3-Next / Qwen3.5、Kimi Linear、Olmo Hybrid 在 2026 年共同收敛到的布局。
 
+**最小示例 30 步训练后的生成结果**（提示 `the quick brown`）：
+
+```
+the quick brown fox jumps over the lazy dog. the lazy dog barks at
+the quick brown fox. to be or not to be,
+```
+
 ---
 
-## 状态
+## 技术选型：为什么是这些方案
 
-| 项目 | 数值 |
-|---|---|
-| 交付门禁 | **10 / 10 全绿** |
-| 单元测试 | **39 / 39 通过** |
-| 微指令 | **1024 / 1024 条可执行**（32 家族） |
-| 梯度检验 | 全部模块解析反向 vs 中心差分，最大绝对误差 **2.47e-08** |
-| 依赖 | 仅 NumPy（+ pytest 用于测试） |
-| 硬件 | 纯 CPU，无 GPU 要求 |
+### 方向选择：为什么做 LLM 全栈
+
+晨星已有 100+ 个开源仓库，覆盖经典 ML、GNN、RL、扩散、流匹配、SSM、MoE、RAG 等**部件**，
+但缺一个把它们整合起来的**端到端 LLM 栈**。选这个方向是为了补齐矩阵中价值最高、
+也最能体现"集大成"的那块。
+
+### 架构选择：为什么是 3:1 混合
+
+| 候选 | 结论 | 依据 |
+|---|---|---|
+| 纯注意力（标准 Transformer） | ❌ | KV cache 随上下文线性增长，长上下文成本不可接受 |
+| 纯线性（纯 Mamba / DeltaNet） | ❌ | 在「精确检索某个先前 token」上**结构性失败**：S-NIAH-2 上 Gated DeltaNet 92% vs Mamba2 56%。MiniMax M2 曾全砍线性层、后在 M2.5 回退 —— 这是公开的教训 |
+| **3:1 混合** | ✅ | Qwen3-Next、Qwen3.5、Kimi Linear(KDA)、Olmo Hybrid、Mamba-3(ICLR 2026) **全部收敛到这个比例**；Mamba-3 从任务分布证明 ~25% 注意力比例即最优 |
+
+### 关键组件的对标依据
+
+| 组件 | 采用方案 | 被否决的更强/更流行方案 | 理由 |
+|---|---|---|---|
+| 归一化 | RMSNorm (2019) | LayerNorm | 需减均值+偏置，参数更多、推理更慢，大模型上无质量收益 |
+| 位置编码 | RoPE (RoFormer) | ALiBi、绝对位置 | ALiBi 长上下文外推弱于 RoPE+YaRN；绝对位置外推能力差 |
+| 前馈 | SwiGLU (Shazeer 2020) | ReLU/GELU FFN | 同等参数下 perplexity 明显更差 |
+| 全注意力层 | **MLA** (DeepSeek-V2/V3) | 标准 GQA | 128K 上下文下 KV cache 数十 GB；MLA 把 KV 压到低秩潜向量 |
+| 线性层 | **Gated DeltaNet** (ICLR 2025) | Mamba-2、RetNet | GDN = Mamba-2 + delta rule，在联想回忆任务上显著更强 |
+| 稀疏化 | **DeepSeek-V3 MoE** | Switch / GShard + 辅助损失 | 辅助损失梯度与主目标对抗：α 小压不住 collapse，α 大质量肉眼可见地掉 |
+| 优化器 | **Muon2** (2026-04) | AdamW、Muon | Muon2 在 NS 前插 Adam 二阶矩预条件，3 步达到 Muon 5 步，NS 迭代 −40% |
+| 反向实现 | 手写解析反向 | tape 自动微分 | CPU+NumPy 下 tape AD 慢 3~10 倍，且无法利用 DeltaNet 的递推结构 |
+| 分词 | 字节级 BPE | Unigram (SentencePiece) | Unigram 需 Viterbi 解码、词表训练非确定，破坏「同 seed 逐位一致」门禁 |
+| 后端 | NumPy（仅此一个依赖） | PyTorch / JAX | 目标是「每条反向都能被独立验证、断网可跑」，而非吞吐 |
+
+> **关于 PyTorch 的说明**：PyTorch 在性能上远强于 NumPy，这是事实。
+> 本项目选 NumPy 是有意识的目标取舍 —— 可验证性优先。
+> 若你的目标是训练生产级模型，应当用 fla + PyTorch；
+> 本项目的价值在于架构设计与正确性参照。
+
+---
+
+## 架构说明
+
+### 十层分解
+
+| 层 | 模块 | 采用的世界顶级方案 |
+|---|---|---|
+| **L0** | 数值内核 | logsumexp 稳定化（LAPACK 传统）、Newton-Schulz 正交化（Muon 公开系数 3.4445/−4.7750/2.0315）、BLAKE2b 派生种子 |
+| **L1** | 反向契约 | 显式 `backward` 契约 + 中心差分梯度检验（PyTorch `gradcheck` 同款判据） |
+| **L2** | 分词 | 字节级 BPE（Sennrich 2016 + GPT-2/tiktoken 预分词），含 CJK 单字切分改进 |
+| **L3** | 架构原语 | RMSNorm、RoPE、SwiGLU、GQA、**MLA**（低秩 KV + 解耦 RoPE） |
+| **L4** | 序列混合 | **Gated DeltaNet**（delta rule + 遗忘门，沿时间反向递推） |
+| **L5** | 稀疏化 | **DeepSeek-V3 MoE**（sigmoid 亲和度 + 无辅助损失动态偏置 + 共享专家） |
+| **L6** | 优化器 | **Muon2** + AdamW 混合路由（embedding/LM head 走 AdamW） |
+| **L7** | 训练 | 余弦 / WSD 调度、梯度累积、梯度裁剪、bits-per-byte 度量 |
+| **L8** | 推理 | KV 状态缓存、per-channel INT8 / group-wise INT4、MTP 投机解码 |
+| **L9** | 对齐 | DPO / IPO / SimPO / KTO，统一走 `backward(g_logits=...)` 入口 |
+| **L10** | 微指令 + 门禁 | **1024 条可执行微指令**（32 家族 × 32）+ 10 道交付门禁 |
+
+完整推导与逐层详解见 [ARCHITECTURE.md](ARCHITECTURE.md)。
+
+### 模型组装
+
+```
+Pre-RMSNorm → Mixer(GDN 或 MLA) → 残差 → Pre-RMSNorm → FFN(MoE 或 Dense) → 残差
+```
+
+两种布局（都实现，用基准数据说话）：
+
+| 布局 | 来源 | 做法 |
+|---|---|---|
+| `interleave` | Qwen3-Next / Kimi Linear | 每 4 层固定 3:1 交错 |
+| `edge` | Mamba-3 (ICLR 2026) | 全注意力集中在**首尾**：早层捕获全局结构、晚层做精确检索 |
+
+### 可证门禁（不是测试，是「能力声明」）
+
+| 门禁 | 检验什么 | 实测值 |
+|---|---|---|
+| G1 确定性 | 同 seed 两次运行参数逐位一致 | diff = 0.000e+00 |
+| G2 梯度正确 | 7 个核心模块解析反向 vs 中心差分 | 最大绝对误差 2.47e-08 |
+| G3 训练有效 | 固定步数后训练损失显著下降 | 4.2458 → 3.1017（−26.9%） |
+| G4 可过拟合 | 极小数据集上损失压到 50% 以下 | 4.1230 → 0.0674 |
+| G5 微指令 | 1024 条全部可执行且输出有限 | 1024/1024 |
+| G6 MoE 均衡 | 过载专家偏置被压低、欠载被抬高 | −0.0800 < +0.0800 |
+| G7 Muon2 | 3 步 NS 对齐度 ≥ Muon 5 步的 90% | 0.9219 vs 0.9742（94.6%） |
+| G8 缓存等价 | KV cache 增量 == 整序列重算 | 2.22e-16 |
+| G9 量化 | INT8 < 1e-2、INT4 < 2e-1，且 INT8 ≤ INT4 | 5.58e-03 / 1.01e-01 |
+| G10 分词 | encode→decode 往返一致 | 4/4（含空格/tab/换行/缩略语） |
+
+**门禁的态度：失败就如实报失败，不允许放宽阈值凑绿。**
 
 ---
 
 ## 快速开始
 
 ```bash
-pip install numpy pytest
+git clone https://github.com/CJX0712/tianji-ai.git
+cd tianji-ai
+pip install -r requirements.lock.txt
 
-# 跑全部测试（约 5 秒）
-python -m pytest tests/ -q
-
-# 跑交付门禁（10 道）
-python -c "import sys; sys.path.insert(0,'.'); \
-           from tianji.verify import run_all_gates; print(run_all_gates().table())"
-
-# 跑完整基准
-python bench/run_bench.py --steps 120
+python scripts/quickstart.py          # 最小示例，约 10 秒
 ```
 
+预期输出（节选）：
+
+```
+1. 分词   词表 432，25680 token，字节压缩比 3.73x
+2. 模型   4 层 布局=LLLA (A=MLA, L=GatedDeltaNet)，参数 252,032
+4. 训练   30 步 2.4s，loss 6.8636 -> 0.2036
+6. 生成   结果='the quick brown fox jumps over the lazy dog. ...'
+7. 门禁   10/10 通过
+✅ 全部通过
+```
+
+Python API：
+
 ```python
-from tianji import TianjiConfig, TianjiModel, init_params, HybridOptimizer, Trainer, DataLoader
+from tianji import TianjiConfig, TianjiModel, init_params
 
 cfg = TianjiConfig(vocab_size=512, d_model=96, n_layers=8)
 model = TianjiModel(cfg, init_params(cfg, seed=0))
 
-out = model.forward(tokens, targets)     # tokens/targets: (B, T) int64
-grads = model.backward()                 # 参数梯度字典
+out = model.forward(tokens, targets)   # (B, T) int64
+grads = model.backward()               # 参数梯度字典
 ```
 
 ---
 
-## 十层架构一览
+## 复现步骤
 
-| 层 | 模块 | 采用的世界顶级方案 |
-|---|---|---|
-| **L0** | 数值内核 | logsumexp 稳定化（LAPACK 传统）、Newton-Schulz 正交化（Muon 公开系数）、BLAKE2b 派生种子 |
-| **L1** | 反向契约 | 显式 `backward` 契约 + 中心差分梯度检验（PyTorch `gradcheck` 同款判据） |
-| **L2** | 分词 | 字节级 BPE（Sennrich 2016 + GPT-2/tiktoken 预分词），含 CJK 单字切分改进 |
-| **L3** | 架构原语 | RMSNorm、RoPE、SwiGLU、GQA、**MLA**（DeepSeek-V2/V3 低秩 KV + 解耦 RoPE） |
-| **L4** | 序列混合 | **Gated DeltaNet**（Yang et al. ICLR 2025，delta rule + 遗忘门） |
-| **L5** | 稀疏化 | **DeepSeek-V3 MoE**（sigmoid 亲和度 + 无辅助损失动态偏置 + 共享专家） |
-| **L6** | 优化器 | **Muon2**（2026-04，Adam 二阶矩预条件 + NS 正交化）+ AdamW 混合路由 |
-| **L7** | 训练 | 余弦 / WSD 调度、梯度累积、梯度裁剪、bits-per-byte 度量 |
-| **L8** | 推理 | KV 状态缓存、per-channel INT8 / group-wise INT4、MTP 投机解码 |
-| **L9** | 对齐 | DPO / IPO / SimPO / KTO，统一走 `backward(g_logits=...)` 入口 |
-| **L10** | 微指令+门禁 | **1024 条可执行微指令**（32 家族 × 32）+ 10 道交付门禁 |
+### 方案 A：一键脚本（推荐，跨平台，不需要 Docker）
 
----
+```bash
+# Linux / macOS
+./scripts/reproduce.sh              # 完整：建环境 → 测试 → 门禁 → 示例 → 训练 → 推理
+./scripts/reproduce.sh --quick      # 快速：只跑测试 + 门禁 + 最小示例
 
-## 为什么是这些选择（关键决策依据）
+# Windows
+scripts\reproduce.bat
+scripts\reproduce.bat --quick
+```
 
-完整对比见 [ARCHITECTURE.md](ARCHITECTURE.md)。这里列出最关键的四个：
+脚本会自建 `.venv`、安装锁定依赖、依次跑完 6 个步骤，全程不污染系统环境。
 
-**1. 为什么是 3:1 混合，而不是纯注意力或纯线性**
+### 方案 B：手动 pip
 
-纯注意力的 KV cache 随上下文线性增长；纯线性在"精确检索某个先前 token"上结构性失败
-（S-NIAH-2 上 Gated DeltaNet 92% vs Mamba2 56%）。MiniMax M2 曾全砍线性层、后又回退，
-是公开的教训。2026 年 Qwen3-Next、Kimi Linear、Olmo Hybrid、Mamba-3 全部收敛到 3:1，
-本项目把 `layout` 做成可选项，用基准数据说话。
+```bash
+python -m venv .venv && source .venv/bin/activate      # Windows: .venv\Scripts\activate
+pip install -r requirements.lock.txt                    # 锁定版本，保证逐位一致
 
-**2. 为什么 MoE 用"无辅助损失"的偏置调节**
+make verify-all        # 测试 + 门禁 + 最小示例（交付自查）
+```
 
-辅助损失把"均衡"写进损失函数，于是均衡梯度与语言建模梯度在同一条反向路径上互相拉扯：
-α 小了压不住 collapse，α 大了质量肉眼可见地掉。DeepSeek-V3 把均衡搬出损失函数，
-改成只对路由生效的控制器（偏置 bᵢ），梯度路径彻底解耦 —— 这是架构级解法，不是调参技巧。
+### 方案 C：Docker（可选）
 
-**3. 为什么优化器默认 Muon2 而不是 Muon**
+```bash
+docker build -t tianji:latest .
+docker run --rm tianji:latest gates      # 跑 10 道门禁
+docker run --rm tianji:latest test       # 跑 39 个测试
 
-Muon 的 Newton-Schulz 迭代要在"病态的动量矩阵"上做极近似。Muon2 在 NS 之前先插一层
-Adam 式二阶矩预条件，把谱结构修好，于是 **3 步 NS 就达到 Muon 5 步的对齐度**
-（本项目门禁 G7 实测：0.9742 vs 0.9219，判据是 3 步不低于 5 步的 90%）。
+docker compose run --rm tianji train     # 训练，产物落在 ./runs
+docker compose run --rm tianji generate  # 推理
+```
 
-**4. 为什么手写反向而不是用自动微分**
+> **网络前提（如实说明）**：Docker 路径需要能访问 Docker Hub 拉取 `python:3.11-slim`。
+> 本仓库的开发机因网关限制（`auth.docker.io` 返回 Bad Gateway）**未能完成镜像构建验证**；
+> Dockerfile 本身已解析通过，失败发生在拉取基础镜像阶段。
+> 若你的环境同样受限，请直接用方案 A 或 B（等价且更快），或在 Docker Desktop 的
+> `Settings → Docker Engine` 中配置 `registry-mirrors` 后重试。
+>
+> 选 `python:3.11-slim` 而非 alpine 的理由：NumPy 在 alpine(musl) 上需自行编译
+> OpenBLAS，构建从 30 秒变成 10 分钟，且不同机器可能产出不同浮点结果，破坏可复现性。
 
-CPU + NumPy 后端下 tape AD 慢 3~10 倍（每个算子一次 tape 记录 + dict 查找），
-且无法利用 Gated DeltaNet 的递推结构（应当沿时间反向递推，而非逐节点展开）。
-代价是每个模块必须手写反向 —— 用 L1 的中心差分检验兜底，不靠人眼。
+### 方案 D：完整训练 + 推理
 
----
+```bash
+python scripts/train.py --steps 300 --out runs/default       # 内置语料
+python scripts/train.py --data my.txt --steps 500            # 自己的语料
 
-## 可证门禁（不是测试，是"能力声明"）
+python scripts/generate.py --ckpt runs/default/model.npz \
+    --tokenizer runs/default/tokenizer.txt --prompt "the quick brown" -n 60
+```
 
-| 门禁 | 检验什么 |
-|---|---|
-| G1 确定性 | 同 seed 两次运行参数**逐位一致** |
-| G2 梯度正确 | 7 个核心模块解析反向 vs 中心差分 |
-| G3 训练有效 | 固定步数后训练损失显著下降 |
-| G4 可过拟合 | 极小数据集上损失压到 50% 以下（证明反向真在传播） |
-| G5 微指令 | 1024 条全部可执行且输出有限 |
-| G6 MoE 均衡 | 过载专家偏置被压低、欠载专家被抬高 |
-| G7 Muon2 | 3 步 NS 的对齐度 ≥ Muon 5 步的 90% |
-| G8 缓存等价 | KV cache 增量解码 == 整序列重算（2.22e-16） |
-| G9 量化 | INT8 误差 < 1e-2、INT4 < 2e-1，且 INT8 ≤ INT4 |
-| G10 分词 | encode→decode 往返完全一致（含多空格/tab/换行/缩略语） |
+checkpoint 加载时**强制校验 sha256 与参数指纹**，损坏文件直接报错，不会静默生成乱码。
 
-**门禁的态度：失败就如实报失败，不允许放宽阈值凑绿。**
-报告同时给出 status 与实测值，任何人都能复核。
+### 一键复现全部基准
 
----
+```bash
+python bench/run_bench.py --steps 120 --seed 0     # 约 2 分钟，写 bench/results/bench.json
+```
 
-## 开发过程中真实修掉的 bug（留档，供后来者避坑）
+### 所有命令（Makefile）
 
-这些都不会崩溃、形状全对，只是"永远训不好"——是最阴险的一类：
-
-| Bug | 症状 | 根因 |
-|---|---|---|
-| Pre-Norm 反传顺序颠倒 | 梯度形状全对，数值全错 | 把 Norm 的 backward 放在子层**，正确顺序是先过子层再过 Norm** |
-| 交叉熵反向用了 log-softmax | 数值差分完全对不上 | 归一化指数族的 Jacobian 是 `I − softmax`，不是 log-softmax |
-| SwiGLU 的 up 分支梯度 | 用 `silu(h)` 而非 `silu(gate_raw)` | h 已含乘法，导数必须作用在 gate 的**线性输出**上 |
-| MoE 的 `dWd` | 用了 `dH` 而非激活 `h` | down 投影的权重梯度是 `Gyᵀ @ h` |
-| 共享专家的 `dx` 多一项 | 多加了 `dH @ sWdᵀ` | 中间隔着 SwiGLU，梯度不能直传回 x |
-| KV cache 的 RoPE 位置 | 增量解码用了**局部位置 0** | 必须传绝对位置 `pos`，否则长文本质量崩掉但不报错 |
-| 矩形因果掩码 | 左对齐会让最新 token 看不到历史 | 必须**右对齐**：`j ≤ i + (Tkv − Tq)` |
-| 梯度检验判据 | 正确反向被判 FAIL（比值 1.0000） | atol 必须用**全局**梯度尺度，不能按单个元素量级设 |
+```bash
+make help          # 查看全部目标
+make test          # 39 个单元测试
+make gates         # 10 道交付门禁
+make bench         # 完整基准
+make quickstart    # 最小示例
+make train         # 训练
+make generate      # 推理
+make docker-build  # 构建镜像
+make docker-test   # 容器内跑测试+门禁
+make verify-all    # 交付前自查
+```
 
 ---
 
-## 目录结构
+## 性能对比数据
+
+完整数据见 [BENCHMARKS.md](BENCHMARKS.md)。**实验条件先说清楚**：
+NumPy 2.5.4 纯 CPU、合成 2 阶马尔可夫语料（vocab=64）、d_model=64 / 6 层 / MoE(4专家 top-2)、
+120 步、batch=8、seq=32。
+
+### B1 · 架构对比
+
+| 架构 | 参数量 | 训练 loss | **验证 loss** | ms/步 |
+|---|---:|---:|---:|---:|
+| **Hybrid 3:1（GDN + MLA）** | 396,544 | 4.3812 | **4.2236** | 157 |
+| 全注意力（MLA） | 364,224 | **4.3451** | 4.2933 | 88 |
+| 全 GDN（无注意力层） | 396,544 | 4.3564 | 4.2305 | 156 |
+
+混合架构验证损失比全注意力低 **1.6%**。差异幅度小、单一 seed，**不足以断言质量更优** ——
+真正的收益在下面 B5。
+
+### B5 · KV cache（本架构最硬的收益）
+
+| 上下文 T | 混合 3:1 | 全注意力 | 节省 |
+|---:|---:|---:|---:|
+| 128 | 192 KB | 1,152 KB | **83.3%** |
+| 2048 | 3,072 KB | 18,432 KB | **83.3%** |
+| 8192 | 12,288 KB | 73,728 KB | **83.3%** |
+
+6 层中只有 1 层需要 KV cache，节省 = 1 − 1/6 = **83.3%**，与上下文长度无关。
+**对照工业界**：Kimi Linear（48B，KDA + MLA 混合 3:1）报告 KV cache −75%、
+百万上下文下解码最高 6× 加速。本项目与之同量级（层数比例不同）。
+
+### B4 · 量化
+
+| 精度 | 权重相对误差 | perplexity | 退化 |
+|---|---:|---:|---:|
+| FP64 基线 | — | 66.14 | — |
+| INT8 (per-channel) | 5.744e-03 | 66.50 | **+0.55%** |
+| INT4 (group-wise, g=32) | 9.439e-02 | 66.78 | **+0.97%** |
+
+### B3 · 优化器（**负面结果，如实报告**）
+
+| 优化器 | 训练 loss | 验证 loss |
+|---|---:|---:|
+| AdamW (lr 3e-3) | **4.1203** | 4.2440 |
+| Muon (NS 5 步) | 4.4775 | **4.1777** |
+| Muon2 (NS 3 步) | 4.3812 | 4.2236 |
+
+**Muon2 在本项目规模下验证损失略逊于 Muon（4.2236 vs 4.1777）**，
+与 Muon2 论文（60M~15.5B 规模）的结论**不一致**。两条诚实解释：
+
+1. **规模**：论文结论建立在千万到百亿参数、数千步训练上；本项目 40 万参数、120 步，
+   优化器差异淹没在噪声里。
+2. **实现保真度**：本项目只实现论文核心改动，未复现其分布式通信与 NS 步数自适应调度。
+   门禁 G7 实测 3 步对齐度是 5 步的 **94.6%**，未达论文声称的「3 步 ≥ 5 步」。
+
+默认仍是 Muon2（少 40% NS 迭代）；追求本规模极限质量可切 Muon（`--optim muon`）。
+
+### 与现有最优方案的定位对比
+
+| 维度 | **本项目** | nanoGPT | llama.cpp | fla (flash-linear-attention) |
+|---|---|---|---|---|
+| 定位 | 可验证的混合架构**全栈** | 教学级 GPT 实现 | 生产推理引擎 | 线性注意力 GPU 内核库 |
+| 依赖 | **仅 NumPy** | PyTorch | C++（无 Python 依赖） | Triton + PyTorch |
+| 架构 | **3:1 混合**（GDN + MLA + MoE） | 纯注意力 | 推理（多架构） | 内核层（不含完整模型） |
+| 训练 | ✅ CPU 可训 | ✅ GPU | ❌ | ✅ GPU |
+| 量化 / 投机解码 | ✅ | ❌ | ✅ | ❌ |
+| 对齐（DPO 等） | ✅ | ❌ | ❌ | ❌ |
+| **可证门禁** | **✅ 10 道** | ❌ | ❌ | 部分 |
+| 吞吐 | 低（NumPy CPU） | 高 | 极高 | 极高 |
+
+**诚实的结论**：本项目**不追求吞吐**。它的对标对象是「正确性可独立验证的研究级实现」，
+生产场景应直接用 fla + PyTorch 或 llama.cpp。本项目的价值在于：
+把 2026 年的混合架构设计用**最少依赖**完整实现一遍，并把每一条反向都用有限差分钟住。
+
+---
+
+## 引用来源清单
+
+按架构层级组织，全部为公开成果。实现时直接采用其算法与公式，未重新发明。
+
+### 数值与优化
+
+- **Muon**: Keller Jordan et al., *Muon: An optimizer for hidden layers in neural networks*, 2024（NanoGPT speedrun 社区）。Newton-Schulz 系数 (3.4445, −4.7750, 2.0315)。
+- **Muon2**: Zhang et al., *Muon²: Boosting Muon via Adaptive Second-Moment Preconditioning*, arXiv 2026-04。
+- **AdamW**: Loshchilov & Hutter, *Decoupled Weight Decay Regularization*, ICLR 2019。
+- **梯度裁剪**: Pascanu et al., *On the difficulty of training recurrent neural networks*, ICML 2013。
+- **幂迭代 / 谱范数**: Golub & Van Loan, *Matrix Computations*（第 4 版）第 7 章。
+
+### 架构原语
+
+- **RMSNorm**: Zhang & Sennrich, *Root Mean Square Layer Normalization*, NeurIPS 2019。
+- **RoPE**: Su et al., *RoFormer: Enhanced Transformer with Rotary Position Embedding*, 2021。
+- **SwiGLU**: Shazeer, *GLU Variants Improve Transformer*, 2020。
+- **GQA**: Ainslie et al., *GQA: Training Generalized Multi-Query Transformer Models*, EMNLP 2023。
+- **MLA**: DeepSeek-AI, *DeepSeek-V2*, 2024；*DeepSeek-V3 Technical Report*, 2024。
+
+### 序列混合
+
+- **Delta Rule**: Schlag et al., *Linear Transformers Are Secretly Fast Weight Programmers*, ICML 2021。
+- **Gated DeltaNet**: Yang et al., *Gated Delta Networks: Improving Mamba2 with Delta Rule*, ICLR 2025（NVIDIA）。
+- **GLA**: Yang et al., *Gated Linear Attention Transformers with Hardware-Efficient Training*, ICML 2024。
+- **Mamba / Mamba-2**: Gu & Dao, *Mamba*, 2023；*Transformers are SSMs*, ICML 2024。
+- **Mamba-3**: Gu, Dao et al., ICLR 2026（3:1 比例的理论最优性、注意力层 placement）。
+
+### 稀疏化
+
+- **MoE 基础**: Shazeer et al., *Outrageously Large Neural Networks*, 2017。
+- **Switch / GShard**: Fedus et al., JMLR 2022；Lepikhin et al., ICLR 2021。
+- **ST-MoE（router z-loss）**: Zoph et al., 2022。
+- **无辅助损失负载均衡**: DeepSeek-V3 Technical Report, 2024。
+
+### 分词
+
+- **BPE**: Sennrich et al., *Neural Machine Translation of Rare Words with Subword Units*, ACL 2016。
+- **GPT-2 字节级 BPE / 预分词**: Radford et al., 2019；OpenAI `tiktoken`。
+
+### 推理
+
+- **投机解码**: Leviathan et al., *Fast Inference from Transformers via Speculative Decoding*, ICML 2023；Chen et al., 2023。
+- **MTP 作 draft**: DeepSeek-V3 Technical Report, 2024。
+- **AWQ**: Lin et al., *AWQ: Activation-aware Weight Quantization*, MLSys 2024。
+- **GPTQ**: Frantar et al., ICLR 2023。
+- **per-channel INT8 (Q8_0)**: llama.cpp / GGML。
+- **Top-p 采样**: Holtzman et al., *The Curious Case of Neural Text Degeneration*, ICLR 2020。
+
+### 对齐
+
+- **DPO**: Rafailov et al., *Direct Preference Optimization*, NeurIPS 2023。
+- **IPO**: Azar et al., *A General Theoretical Paradigm for Understanding RLHF*, ICML 2024。
+- **SimPO**: Meng et al., *SimPO: Simple Preference Optimization*, 2024。
+- **KTO**: Ethayarajh et al., *KTO: Model Alignment as Prospect Theoretic Optimization*, ICML 2024。
+
+### 工程参照
+
+- **Hybrid 3:1 收敛**: Qwen3-Next / Qwen3.5（Alibaba）、Kimi Linear（Moonshot AI，KDA）、Olmo Hybrid（AI2，2026）。
+- **反向契约**: PyTorch `torch.autograd.Function` 与 `torch.autograd.gradcheck`。
+- **门禁哲学**: 作者前作 `tianshu-ai`（天枢）——「失败就如实报失败，不允许放宽阈值凑绿」。
+
+---
+
+## 仓库结构
 
 ```
 tianji-ai/
-├── tianji/
-│   ├── l0_numerics.py     数值内核
-│   ├── l1_contract.py     反向契约 + 梯度检验
-│   ├── l2_tokenizer.py    字节级 BPE
-│   ├── l3_primitives.py   RMSNorm / RoPE / SwiGLU / GQA / MLA
-│   ├── l4_deltanet.py     Gated DeltaNet
-│   ├── l5_moe.py          MoE + 无辅助损失负载均衡
-│   ├── l6_optimizer.py    AdamW / Muon / Muon2
-│   ├── l7_train.py        调度 / 数据 / 训练循环
-│   ├── l8_infer.py        缓存 / 量化 / 投机解码
-│   ├── l9_align.py        DPO / IPO / SimPO / KTO
-│   ├── l10_microops.py    1024 条微指令
-│   ├── model.py           模型组装（3:1 混合）
-│   └── verify.py          10 道交付门禁
-├── tests/test_all.py      39 个测试
-├── bench/run_bench.py     基准（产出 results/bench.json）
-├── ARCHITECTURE.md        架构详解与选型依据
-├── BENCHMARKS.md          基准数据
-└── LICENSE                Apache-2.0
+├── tianji/                     # 核心库（14 个模块）
+│   ├── l0_numerics.py         数值内核
+│   ├── l1_contract.py         反向契约 + 中心差分梯度检验
+│   ├── l2_tokenizer.py        字节级 BPE
+│   ├── l3_primitives.py       RMSNorm / RoPE / SwiGLU / GQA / MLA
+│   ├── l4_deltanet.py         Gated DeltaNet（沿时间反向递推）
+│   ├── l5_moe.py              MoE + 无辅助损失动态偏置
+│   ├── l6_optimizer.py        AdamW / Muon / Muon2
+│   ├── l7_train.py            调度 / 数据管道 / 训练循环
+│   ├── l8_infer.py            KV 缓存 / 量化 / 投机解码
+│   ├── l9_align.py            DPO / IPO / SimPO / KTO
+│   ├── l10_microops.py        1024 条微指令（32 家族）
+│   ├── model.py               3:1 混合模型组装
+│   ├── persist.py             checkpoint 保存/加载 + sha256 校验
+│   ├── data.py                内置离线语料
+│   ├── verify.py              10 道交付门禁
+│   └── cli.py                 命令行入口
+├── scripts/
+│   ├── reproduce.sh             一键复现（Linux / macOS，无需 Docker）
+│   ├── reproduce.bat            一键复现（Windows，无需 Docker）
+│   ├── quickstart.py            最小可运行示例（CI 自检入口）
+│   ├── train.py                 训练脚本
+│   ├── generate.py              推理脚本
+│   ├── quick_gradcheck.py       模块梯度冒烟
+│   └── test_model.py            模型配置冒烟
+├── tests/test_all.py          39 个单元测试
+├── bench/                     基准脚本 + 结果（bench.json）
+├── Dockerfile                 一键环境（python:3.11-slim）
+├── docker-compose.yml         挂载 ./runs 的训练/推理
+├── Makefile                   全部常用命令
+├── pyproject.toml             PEP 621 元数据 + pytest 配置
+├── requirements.txt           依赖声明
+├── requirements.lock.txt      锁定版本（逐位可复现）
+├── README.md / ARCHITECTURE.md / BENCHMARKS.md
+└── LICENSE                    Apache-2.0
 ```
 
 ---
 
-## 已知的边界（不掩饰）
+## 已知边界（不掩饰）
 
-- **语料是确定性合成的 2 阶马尔可夫**，不是真实文本。因此基准的绝对数字**不可与真实语料上的任何结果横向比较**，只用于同实验内不同配置的相对比较。
-- **GDN 的推理态仍是整序列重算**，尚未实现 O(1) 递推增量解码。因此 KV cache 门禁（G8）只对全注意力配置验证。
+- **语料是确定性合成的 2 阶马尔可夫**，不是真实文本。基准的绝对数字
+  **不可与真实语料上的任何结果横向比较**，只用于同实验内不同配置的相对比较。
+- **GDN 的推理态仍是整序列重算**，尚未实现 O(1) 递推增量解码。
+  因此 KV cache 门禁（G8）只对全注意力配置验证。
 - **MTP 是轻量版**：用单个线性投影替代 DeepSeek-V3 原版的完整 Transformer 层。
-- **没有 GPU 路径**：全部是 NumPy CPU 实现，模型规模在百万参数以下。
-- **1024 条微指令中**，部分家族（`sweep` 型，见 `FAMILY_KIND`）的成员是同一算子的参数扫描，用于覆盖数值边界，不是 1024 个语义独立的算子。这个区分在代码里显式标注。
+- **没有 GPU 路径**：纯 NumPy CPU 实现，模型规模在百万参数以下。
+- **1024 条微指令中**，17 个家族（`FAMILY_KIND = "sweep"`）的成员是同一算子的参数扫描，
+  用于覆盖数值边界，不是 1024 个语义独立算子。这个区分在代码里显式标注。
+- **投机解码的 2.0 token/轮是 γ=1 下的理论上限**，不是真实加速比（见 BENCHMARKS.md）。
 
 ---
 
-## 许可证
+## 交付前自查（已执行）
 
-Apache License 2.0。详见 [LICENSE](LICENSE)。
+| 检查项 | 结果 |
+|---|---|
+| 单元测试 | ✅ 39 / 39 通过（3.99s） |
+| 交付门禁 | ✅ 10 / 10 全绿 |
+| 微指令 | ✅ 1024 / 1024 可执行 |
+| 最小可运行示例 | ✅ `scripts/quickstart.py` 5.4s 全通过 |
+| 占位符扫描 | ✅ 无 TODO / FIXME / 未实现桩（2 处 `NotImplementedError` 为抽象基类方法） |
+| 缺失文件 | ✅ 源码、测试、基准、Docker、锁依赖、文档、许可证齐全 |
+| 模型梯度 | ✅ 解析反向 vs 中心差分，最大绝对误差 2.47e-08 |
+| checkpoint 往返 | ✅ 保存+加载逐位一致，sha256 校验通过 |
+| 断网可跑 | ✅ 内置语料，无任何下载依赖 |
 
-作者：**晨星（Chenxing）**
+---
+
+## 许可证与署名
+
+Apache License 2.0，详见 [LICENSE](LICENSE)。
+
+**作者：晨星（Chenxing）** · GitHub: [@CJX0712](https://github.com/CJX0712)
+
+本项目遵循「零重写」原则：所有算法与架构设计均直接采用上述公开成果，
+并在源码注释中标注来源与被否决的替代方案。若发现某处有更强的现成方案，
+欢迎提 Issue —— 按项目原则应立即替换。

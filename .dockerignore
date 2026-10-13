@@ -1,0 +1,13 @@
+.git
+.gitignore
+.pytest_cache
+__pycache__
+*.py[cod]
+*.egg-info
+runs/
+*.npz
+*.npz.meta.json
+.DS_Store
+.venv
+venv
+docs/_build
