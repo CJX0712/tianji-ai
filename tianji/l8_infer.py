@@ -62,13 +62,15 @@ def quantize_groupwise(W: np.ndarray, bits: int = 4, group: int = 32) -> tuple[n
     """
     W = np.asarray(W, dtype=np.float64)
     out, in_ = W.shape
-    # 分组大小不得超过输入维：否则 pad 会把矩阵撑大，
-    # dequantize 出来的形状与权重不匹配（本项目基准里踩过这个坑）。
+    # 分组大小不得超过输入维（否则 pad 会撑大矩阵）
     group = int(min(group, max(in_, 1)))
+    # 必须整除，且**不能靠 pad 解决**：padding 会让 dequantize 的输出形状
+    # 与原始权重不一致（例如 in_=48 / group=32 会 pad 到 64，
+    # 回灌进模型后与 RMSNorm 增益形状对不上）。
+    # 因此改为把 group 下调到「不超过设定值且能整除 in_ 的最大值」。
     if in_ % group != 0:
-        pad = group - (in_ % group)
-        W = np.concatenate([W, np.zeros((out, pad))], axis=-1)
-        in_ += pad
+        cands = [g for g in range(1, min(group, in_) + 1) if in_ % g == 0]
+        group = max(cands) if cands else in_
     qmax = 2 ** (bits - 1) - 1
     Wg = W.reshape(out, in_ // group, group)
     scale = np.max(np.abs(Wg), axis=-1) / qmax
