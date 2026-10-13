@@ -1,0 +1,156 @@
+{
+  "seed": 0,
+  "steps": 120,
+  "architecture": [
+    {
+      "params": 396544,
+      "layers": "LLLALL",
+      "final_loss": 4.3811556516442165,
+      "best_loss": 4.302840341376754,
+      "val_loss": 4.223609449355607,
+      "seconds": 18.826138019561768,
+      "tokens_per_s": 1631.7738650422948,
+      "ms_per_step": 156.88448349634805,
+      "name": "Hybrid 3:1 (GDN+MLA)"
+    },
+    {
+      "params": 364224,
+      "layers": "AAAAAA",
+      "final_loss": 4.345106428923507,
+      "best_loss": 4.224641560205549,
+      "val_loss": 4.2932671307340655,
+      "seconds": 10.562165975570679,
+      "tokens_per_s": 2908.494343968135,
+      "ms_per_step": 88.01804979642232,
+      "name": "全注意力 (MLA)"
+    },
+    {
+      "params": 396544,
+      "layers": "LLLLLA",
+      "final_loss": 4.356421052478509,
+      "best_loss": 4.2565595584961144,
+      "val_loss": 4.230503941961048,
+      "seconds": 18.68712615966797,
+      "tokens_per_s": 1643.9124848582833,
+      "ms_per_step": 155.7260513305664,
+      "name": "全 GDN (无注意力)"
+    }
+  ],
+  "layout": [
+    {
+      "params": 396544,
+      "layers": "LLLALL",
+      "final_loss": 4.3811556516442165,
+      "best_loss": 4.302840341376754,
+      "val_loss": 4.223609449355607,
+      "seconds": 17.511744022369385,
+      "tokens_per_s": 1754.2513161886377,
+      "ms_per_step": 145.93120018641153,
+      "name": "layout=interleave",
+      "layout": "interleave"
+    },
+    {
+      "params": 390080,
+      "layers": "ALLLLA",
+      "final_loss": 4.463015507549433,
+      "best_loss": 4.3608395938957365,
+      "val_loss": 4.213494907760222,
+      "seconds": 15.382881164550781,
+      "tokens_per_s": 1997.0251132663614,
+      "ms_per_step": 128.1906763712565,
+      "name": "layout=edge",
+      "layout": "edge"
+    }
+  ],
+  "optimizer": [
+    {
+      "params": 396544,
+      "layers": "LLLALL",
+      "final_loss": 4.120319900897203,
+      "best_loss": 4.016161141030265,
+      "val_loss": 4.244047122842355,
+      "seconds": 14.398514032363892,
+      "tokens_per_s": 2133.553499406252,
+      "ms_per_step": 119.98761693636577,
+      "name": "adamw",
+      "lr": 0.003
+    },
+    {
+      "params": 396544,
+      "layers": "LLLALL",
+      "final_loss": 4.477534262546401,
+      "best_loss": 4.4205074873457395,
+      "val_loss": 4.177692086829216,
+      "seconds": 17.244263887405396,
+      "tokens_per_s": 1781.4619516717562,
+      "ms_per_step": 143.70219906171164,
+      "name": "muon",
+      "lr": 0.03
+    },
+    {
+      "params": 396544,
+      "layers": "LLLALL",
+      "final_loss": 4.3811556516442165,
+      "best_loss": 4.302840341376754,
+      "val_loss": 4.223609449355607,
+      "seconds": 17.14277195930481,
+      "tokens_per_s": 1792.0089045649177,
+      "ms_per_step": 142.85643299420676,
+      "name": "muon2",
+      "lr": 0.03
+    }
+  ],
+  "quantization": [
+    {
+      "name": "FP64",
+      "loss": 4.191751839990171,
+      "ppl": 66.13855369516534,
+      "rel_err": 0.0
+    },
+    {
+      "name": "INT8",
+      "loss": 4.197195973676649,
+      "ppl": 66.49960273117355,
+      "rel_err": 0.005743752301410484
+    },
+    {
+      "name": "INT4",
+      "loss": 4.201442068105353,
+      "ppl": 66.78256664445216,
+      "rel_err": 0.09439349775376077
+    }
+  ],
+  "cache": [
+    {
+      "T": 128,
+      "hybrid_bytes": 196608,
+      "full_attn_bytes": 1179648,
+      "ratio": 0.16666666666666666
+    },
+    {
+      "T": 512,
+      "hybrid_bytes": 786432,
+      "full_attn_bytes": 4718592,
+      "ratio": 0.16666666666666666
+    },
+    {
+      "T": 2048,
+      "hybrid_bytes": 3145728,
+      "full_attn_bytes": 18874368,
+      "ratio": 0.16666666666666666
+    },
+    {
+      "T": 8192,
+      "hybrid_bytes": 12582912,
+      "full_attn_bytes": 75497472,
+      "ratio": 0.16666666666666666
+    }
+  ],
+  "speculative": {
+    "drafted": 16,
+    "accepted": 16,
+    "accept_rate": 1.0,
+    "tokens_per_verify": 2.0
+  },
+  "timestamp": "2026-10-14 00:06:44"
+}
