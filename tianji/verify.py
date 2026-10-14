@@ -14,7 +14,7 @@
     G5  微指令        1024 条全部可执行且输出有限
     G6  MoE 均衡      无辅助损失偏置控制器让负载变异系数下降
     G7  Muon2 优势    3 步 NS 的正交化质量 >= Muon 5 步
-    G8  缓存等价      KV cache 增量解码 == 整序列重算
+    G8  缓存等价      混合架构(GDN 递推 + MLA KV)增量解码 == 整序列重算
     G9  量化有界      INT8/INT4 的误差有界，且 INT8 退化 <= INT4退化
     G10 分词往返      decode(encode(s)) == s
 """
@@ -240,11 +240,15 @@ def run_all_gates(seed: int = 0, steps: int = 60, verbose: bool = True) -> GateR
         q_muon5=float(q5), q_muon2_3=float(q3))
     R.results[-1].seconds = time.time() - t0
 
-    # ---------------------------------------------------------- G8 缓存等价
+    # ---------------------------------------------------------- G8 缓存等价（混合架构）
+    # 覆盖「GDN 的 O(1) 递推增量解码」与「MLA 的 KV cache 增量解码」两者：
+    # 每步只喂 1 个新 token，历史全部来自 cache（GDN 递推状态 + MLA KV）。
+    # 这是关闭 README「已知边界」第 4 条的关键门禁 —— 递推增量必须 ≡ 整序列重算
+    # 到机器精度。hybrid_ratio=3 ⇒ 3:1 混合（GDN 线性层 + MLA 全注意力层）。
     t0 = time.time()
     cfg3 = _small_cfg()
     cfg3.mtp_depth = 0
-    cfg3.hybrid_ratio = 0          # 全注意力：KV cache 只对 attention 层有意义
+    cfg3.hybrid_ratio = 3          # 3:1 混合：同时验证 GDN 递推 cache 与 MLA KV cache
     cfg3.n_experts = 1
     P3 = init_params(cfg3, seed=seed)
     m3 = TianjiModel(cfg3, P3)
@@ -259,7 +263,7 @@ def run_all_gates(seed: int = 0, steps: int = 60, verbose: bool = True) -> GateR
     inc = np.stack(step_logits)[None, ...]
     d = float(np.max(np.abs(full - inc)))
     add("缓存等价", d < 1e-10,
-        f"KV cache 增量解码 vs 整序列重算 最大差 {d:.2e}", diff=d)
+        f"混合架构(GDN+MLA)增量解码 vs 整序列重算 最大差 {d:.2e}", diff=d)
     R.results[-1].seconds = time.time() - t0
 
     # ---------------------------------------------------------- G9 量化

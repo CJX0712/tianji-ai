@@ -120,16 +120,35 @@ def generate(model, prompt: np.ndarray, max_new: int = 32, *,
              use_cache: bool = True) -> list[int]:
     """自回归生成。
 
-    注意：GDN 层是递推结构，其状态天然是 O(1) 的，但本实现的 GDN 前向
-    是「整序列重算」。use_cache=True 时只对全注意力层启用 KV cache；
-    GDN 层仍整序列重算 —— 对短生成这是安全的（结果严格一致），
-    真正的 O(1) 递推增量解码留作后续优化（不变量 I1 已钉住等价性）。
+    use_cache=True 时走**真正的 O(1) 递推增量解码**：先把整段 prompt 逐
+    token 送入以建立 GDN 递推状态 S 与 MLA 的 KV cache（prefill），随后每个
+    新 token 只做一步秩-1 状态更新 + 一次 KV 追加，复杂度与上下文长度无关。
+    这与门禁 G11 验证的「递推增量 ≡ 整序列重算」是同一套路径。
     """
     ids = list(np.asarray(prompt).reshape(-1).tolist())
     cache = {} if use_cache else None
+    if use_cache:
+        # ---- prefill：逐 token 建立递推/KV 状态（位置 0..L-1） ----
+        out = None
+        for t in range(len(ids)):
+            out = model.forward(np.asarray([[ids[t]]], dtype=np.int64),
+                                cache=cache, pos=t)
+        # `out` 已是位置 L 的 logits（第一个待生成 token 的分布）
+        nxt = sample_top_p(out["logits"][0, -1], top_p=top_p,
+                           temperature=temperature, seed=seed + len(ids))
+        ids.append(nxt)
+        for _ in range(max_new - 1):
+            pos = len(ids) - 1                      # 新 token 的绝对位置
+            out = model.forward(np.asarray([[ids[pos]]], dtype=np.int64),
+                                cache=cache, pos=pos)
+            nxt = sample_top_p(out["logits"][0, -1], top_p=top_p,
+                               temperature=temperature, seed=seed + len(ids))
+            ids.append(nxt)
+        return ids
+    # ---- 不使用缓存：整序列重算（结果严格一致） ----
     for _ in range(max_new):
         x = np.asarray([ids], dtype=np.int64)
-        out = model.forward(x, cache=cache)
+        out = model.forward(x)
         nxt = sample_top_p(out["logits"][0, -1], top_p=top_p,
                            temperature=temperature, seed=seed + len(ids))
         ids.append(nxt)

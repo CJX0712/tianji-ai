@@ -38,7 +38,7 @@ from .l0_numerics import spawn_seed, rng
 from .l1_contract import Ctx
 from .l3_primitives import (Linear, RMSNorm, RoPE, SwiGLU, CausalAttention,
                             CrossEntropy, rope_tables, silu)
-from .l4_deltanet import GatedDeltaNet, CausalConv1D
+from .l4_deltanet import GatedDeltaNet, CausalConv1D, gdn_init_state, gdn_step
 from .l5_moe import MoELayer, sigmoid
 
 __all__ = ["TianjiConfig", "TianjiModel", "init_params", "build_layer_layout"]
@@ -224,7 +224,7 @@ class TianjiModel:
             p = f"L{i}."
             h, c1 = self._rms(x, P[p + "norm1_w"])
             if kind == "gdn":
-                m, sub = self._gdn_fwd(h, i, p)
+                m, sub = self._gdn_fwd(h, i, p, cache, pos)
             else:
                 m, sub = self._attn_fwd(h, i, p, cache, pos)
             xm = x + m
@@ -262,11 +262,56 @@ class TianjiModel:
         c = Ctx()
         return RMS.forward(c, x, w), c
 
-    def _gdn_fwd(self, h, i, p):
+    def _gdn_fwd(self, h, i, p, cache=None, pos=0):
         cfg, P = self.cfg, self.P
         B, T, d = h.shape
         H, dh, di = cfg.n_heads, cfg.d_head, cfg.dim_inner
         s = {}
+
+        if cache is not None:
+            # ========================================================
+            # O(1) 递推增量解码（关闭 README「已知边界」第 4 条）
+            # 每个新 token 只做一次的秩-1 状态更新，而非整序列重算。
+            # 操作序列与 `GatedDeltaNet.forward` 的循环体逐位一致，
+            # 故门禁可证「递推增量 ≡ 整序列重算」到机器精度（≈1e-16）。
+            # ========================================================
+            assert T == 1, "GDN 缓存解码仅支持单 token 步进（自回归生成）"
+            K = self._conv[i].K
+            # 1) 用最近 K-1 个隐藏态拼出卷积窗口（左边界零填充与全序列重算一致）
+            buf = cache.get(f"gdn_h{i}")
+            if buf is None:
+                buf = np.zeros((B, K - 1, d), dtype=np.float64)
+            window = np.concatenate([buf, h], axis=1)          # (B, K, d)
+            cache[f"gdn_h{i}"] = window[:, -K + 1:, :]          # 滚动保留最后 K-1 个
+            # 2) 投影窗口 → 因果卷积 → 取当前 token 那一行
+            qw = LINEAR.forward(s.setdefault("cq", Ctx()), window, P[p + "W_q"])
+            kw = LINEAR.forward(s.setdefault("ck", Ctx()), window, P[p + "W_k"])
+            vw = LINEAR.forward(s.setdefault("cv", Ctx()), window, P[p + "W_v"])
+            qkvw = np.concatenate([qw, kw, vw], axis=-1)
+            qkv = self._conv[i].forward(s.setdefault("cc", Ctx()), qkvw,
+                                        P[p + "conv_w"])[:, -1:, :]          # (B,1,3di)
+            q, k, v = np.split(qkv, 3, axis=-1)
+            q = q.reshape(B, 1, H, dh).transpose(0, 2, 1, 3)
+            k = k.reshape(B, 1, H, dh).transpose(0, 2, 1, 3)
+            v = v.reshape(B, 1, H, dh).transpose(0, 2, 1, 3)
+            beta = sigmoid(LINEAR.forward(s.setdefault("cb", Ctx()), h, P[p + "W_beta"]))
+            alpha = sigmoid(LINEAR.forward(s.setdefault("ca", Ctx()), h, P[p + "W_alpha"]))
+            s["beta_t"] = np.ascontiguousarray(beta.transpose(0, 2, 1))      # (B,H,1)
+            s["alpha_t"] = np.ascontiguousarray(alpha.transpose(0, 2, 1))
+            # 3) 递推步进（O(1) 秩-1 更新）
+            S = cache.get(f"gdn_S{i}", gdn_init_state(B, H, dh))
+            o, S2 = gdn_step(S, q[:, :, 0, :], k[:, :, 0, :], v[:, :, 0, :],
+                             s["beta_t"][:, :, 0], s["alpha_t"][:, :, 0])
+            cache[f"gdn_S{i}"] = S2
+            # 保持与全序列路径一致的 head-major 排列：(B,H,D) -> (B,1,H*D)=di
+            o = o.reshape(B, 1, di)                            # (B,H,D) -> (B,1,di)
+            on, c_on = self._rms(o, P[p + "out_norm_w"])
+            gate_raw = LINEAR.forward(s.setdefault("cga", Ctx()), h, P[p + "W_gate"])
+            gate = silu(gate_raw)
+            s["on"], s["gate"], s["c_on"], s["gate_raw"] = on, gate, c_on, gate_raw
+            y = LINEAR.forward(s.setdefault("co", Ctx()), on * gate, P[p + "W_o"])
+            return y, s
+
         q = LINEAR.forward(s.setdefault("cq", Ctx()), h, P[p + "W_q"])
         k = LINEAR.forward(s.setdefault("ck", Ctx()), h, P[p + "W_k"])
         v = LINEAR.forward(s.setdefault("cv", Ctx()), h, P[p + "W_v"])

@@ -229,12 +229,15 @@ def a78():
            f"g32={d4:+.2f}% (g8对照={d4g8:+.2f}%)", "|退化| < 15%")
 
 
-# ---------------------------------------------------------------- A9 缓存等价
+# ---------------------------------------------------------------- A9 缓存等价（混合架构）
 
 def a9():
+    # hybrid_ratio=3 ⇒ 3:1 混合（GDN 线性层 + MLA 全注意力层）。
+    # 同时验证「GDN 的 O(1) 递推增量解码」与「MLA 的 KV cache 增量解码」
+    # 都 ≡ 整序列重算到机器精度（关闭 README「已知边界」第 4 条）。
     cfg = TianjiConfig(vocab_size=32, d_model=32, n_layers=2, n_heads=4,
                        d_latent_q=16, d_latent_kv=12, d_rope=4, d_ff=32,
-                       n_experts=1, mtp_depth=0, hybrid_ratio=0, max_len=32)
+                       n_experts=1, mtp_depth=0, hybrid_ratio=3, max_len=32)
     m = TianjiModel(cfg, init_params(cfg, seed=0))
     seq = rng(9).integers(0, 32, (1, 8))
     full = m.forward(seq)["logits"]

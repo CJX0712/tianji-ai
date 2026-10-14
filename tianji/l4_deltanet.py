@@ -53,7 +53,8 @@ import numpy as np
 
 from .l1_contract import Ctx, Module
 
-__all__ = ["GatedDeltaNet", "CausalConv1D", "l2norm", "L2Norm"]
+__all__ = ["GatedDeltaNet", "CausalConv1D", "l2norm", "L2Norm",
+           "gdn_init_state", "gdn_step", "gdn_decode_recurrent"]
 
 
 # ---------------------------------------------------------------- L2 归一化
@@ -239,3 +240,79 @@ class GatedDeltaNet(Module):
             dk = (dkh - kh * proj) / n
 
         return dq, dk, dv, dbeta, dalpha
+
+
+# ---------------------------------------------------------------- O(1) 递推增量解码
+#
+# 站在谁之上（零重写）：
+#     Gated DeltaNet 的核心卖点就是「状态 S_t 是 O(1) 的」——
+#     推理时每个新 token 只做 S_t = α(S_{t−1} − β P kᵀ) + β v kᵀ 一次秩-1 更新，
+#     而非整序列重算。这是 GDN 相比全注意力的根本效率来源
+#     （Kimi Linear 据此报告百万上下文解码 6× 加速）。
+#
+# 为什么本项目之前没接：原 README「已知边界」明确标注——
+#     「GDN 的推理态仍是整序列重算，尚未实现 O(1) 递推增量解码」。
+#     这里的 `step` 与 `forward` 用的是**逐位相同**的浮点操作序列，
+#     因此门禁可证明「递推增量 ≡ 整序列重算」到机器精度（≈1e-16），
+#     把这条已知缺口真正关闭，而不是另写一套数值不同的实现。
+#
+# 状态布局：S ∈ R^{B×H×D×D}（与 forward 内部 S_prev 完全一致），
+# 使 o = S q 无需转置。D = d_v = d_k（本项目 GDN 的 d_v 即 d_head）。
+
+def gdn_init_state(B: int, H: int, D: int, dtype=np.float64) -> np.ndarray:
+    """初始化空的 GDN 递推状态 S_0 = 0。"""
+    return np.zeros((B, H, D, D), dtype=dtype)
+
+
+def gdn_step(state: np.ndarray, q_t: np.ndarray, k_t: np.ndarray, v_t: np.ndarray,
+             beta_t: np.ndarray, alpha_t: np.ndarray):
+    """单步 O(1) 递推解码（与 `GatedDeltaNet.forward` 的循环体逐位一致）。
+
+    Parameters
+    ----------
+    state : (B, H, D, D)   上一时刻状态 S_{t−1}
+    q_t   : (B, H, D)      当前 token 的 query（已投影、已 reshape）
+    k_t   : (B, H, D)      当前 token 的 key（已投影、已 reshape；内部做 L2 归一化）
+    v_t   : (B, H, D)      当前 token 的 value（已投影、已 reshape）
+    beta_t: (B, H)         写入强度 ∈ (0,1)
+    alpha_t: (B, H)        遗忘门 ∈ (0,1)
+
+    Returns
+    -------
+    o_t : (B, H, D)        当前 token 的输出
+    S_t : (B, H, D, D)     更新后的状态（直接回写缓存即可）
+    """
+    q_t = np.asarray(q_t, dtype=np.float64)
+    k_t = np.asarray(k_t, dtype=np.float64)
+    v_t = np.asarray(v_t, dtype=np.float64)
+    beta_t = np.asarray(beta_t, dtype=np.float64)
+    alpha_t = np.asarray(alpha_t, dtype=np.float64)
+
+    kh = l2norm(k_t)                                   # (B,H,D)  —— 与 forward 的 l2norm(k) 同序
+    bt = beta_t[..., None, None]                        # (B,H,1,1)
+    at = alpha_t[..., None, None]
+    P = np.einsum("bhvk,bhk->bhv", state, kh)           # S_{t−1} k_t
+    # S_t = α (S_{t−1} − β P kᵀ) + β v kᵀ —— 与 forward 循环体完全相同的表达式
+    S = at * (state - bt * P[..., :, None] * kh[..., None, :]) \
+        + bt * v_t[..., :, None] * kh[..., None, :]
+    o = np.einsum("bhvk,bhk->bhv", S, q_t)
+    return o, S
+
+
+def gdn_decode_recurrent(q: np.ndarray, k: np.ndarray, v: np.ndarray,
+                         beta: np.ndarray, alpha: np.ndarray) -> np.ndarray:
+    """用 `step` 沿时间递推解出整段输出，作为 `forward` 的对照实现。
+
+    q,k,v : (B, H, T, D)   beta,alpha : (B, H, T)
+    返回 o : (B, H, T, D)
+    """
+    q = np.asarray(q, dtype=np.float64)
+    k = np.asarray(k, dtype=np.float64)
+    v = np.asarray(v, dtype=np.float64)
+    B, H, T, D = q.shape
+    S = gdn_init_state(B, H, D)
+    o = np.zeros((B, H, T, D), dtype=np.float64)
+    for t in range(T):
+        o[:, :, t, :], S = gdn_step(S, q[:, :, t, :], k[:, :, t, :],
+                                    v[:, :, t, :], beta[:, :, t], alpha[:, :, t])
+    return o
