@@ -1,5 +1,12 @@
 # 天玑 TIANJI · 混合架构语言模型全栈
 
+<div align="center">
+
+[![License](https://img.shields.io/badge/License-MIT-green)](https://github.com/CJX0712/tianji-ai/blob/main/LICENSE) [![Language](https://img.shields.io/badge/Python-3776AB?logo=python)](https://github.com/CJX0712/tianji-ai) [![Verified](https://img.shields.io/badge/invariants-verified-brightgreen)](https://github.com/CJX0712) [![Author](https://img.shields.io/badge/author-晨星-blueviolet)](https://github.com/CJX0712)
+
+</div>
+
+
 > **Gated DeltaNet × MLA × MoE × Muon2 × 投机解码**
 > 零重写 · 集大成 · 闭环交付 · 可证门禁
 >
