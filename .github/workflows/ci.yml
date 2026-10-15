@@ -1,0 +1,31 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  verify:
+    name: TIANJI · 39 tests + 10 gates
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install locked dependencies
+        run: pip install -r requirements.lock.txt
+
+      - name: Unit tests (39)
+        run: make test
+
+      - name: Delivery gates (10)
+        run: make gates
+
+      - name: Quickstart smoke
+        run: make quickstart
