@@ -8,11 +8,11 @@ version = "1.0.0"
 description = "天玑 TIANJI · 混合架构语言模型全栈（Gated DeltaNet x MLA x MoE x Muon2）"
 readme = "README.md"
 requires-python = ">=3.10"
-license = { text = "Apache-2.0" }
+license = { text = "MIT" }
 authors = [{ name = "晨星 (Chenxing)" }]
 keywords = ["llm", "mixture-of-experts", "mamba", "linear-attention", "transformer", "numpy"]
 classifiers = [
-    "License :: OSI Approved :: Apache Software License",
+    "License :: OSI Approved :: MIT License",
     "Programming Language :: Python :: 3",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
     "Intended Audience :: Science/Research",
