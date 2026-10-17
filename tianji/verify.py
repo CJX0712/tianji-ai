@@ -17,6 +17,8 @@
     G8  缓存等价      混合架构(GDN 递推 + MLA KV)增量解码 == 整序列重算
     G9  量化有界      INT8/INT4 的误差有界，且 INT8 退化 <= INT4退化
     G10 分词往返      decode(encode(s)) == s
+    G11 并行形式等价  Gated DeltaNet 递推（forward）vs 并行前缀扫描（associative scan）
+                    两条不同算法路径逐位一致（线性注意力决定性正确性质）
 """
 
 from __future__ import annotations
@@ -291,6 +293,27 @@ def run_all_gates(seed: int = 0, steps: int = 60, verbose: bool = True) -> GateR
     add("分词往返", roundtrip,
         f"词表 {bpe.size}，{len(tests)} 条测试串 encode->decode 全部一致",
         vocab=bpe.size)
+    R.results[-1].seconds = time.time() - t0
+
+    # ---------------------------------------------------------- G11 并行形式等价
+    # 递推（forward 的顺序循环）vs 并行前缀扫描（associative scan, 分治）必须逐位一致。
+    # 这是 Gated DeltaNet / GLA / Mamba-2 硬件内核正确性的核心证明：同一数学，
+    # 两条不同算法路径（串行递推 vs 可并行前缀和）必须收敛到同一浮点结果。
+    t0 = time.time()
+    from .l4_deltanet import GatedDeltaNet, gdn_parallel
+    from .l1_contract import Ctx as _Ctx
+    gs = rng(spawn_seed(seed, "g11"))
+    Dg = 8
+    qg = gs.standard_normal((2, 2, 12, Dg))
+    kg = gs.standard_normal((2, 2, 12, Dg))
+    vg = gs.standard_normal((2, 2, 12, Dg))
+    bg = gs.random((2, 2, 12))            # beta ∈ (0,1)
+    ag = gs.random((2, 2, 12))            # alpha ∈ (0,1)
+    rec = GatedDeltaNet().forward(_Ctx(), qg, kg, vg, bg, ag)   # 递推形式
+    par = gdn_parallel(qg, kg, vg, bg, ag)                        # 并行形式
+    dg = float(np.max(np.abs(rec - par)))
+    add("并行形式等价", dg < 1e-9,
+        f"Gated DeltaNet 递推 vs 并行前缀扫描 最大差 {dg:.2e}", diff=dg)
     R.results[-1].seconds = time.time() - t0
 
     return R

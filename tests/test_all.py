@@ -17,7 +17,8 @@ from tianji.l2_tokenizer import BPE, pretokenize            # noqa: E402
 from tianji.l3_primitives import (                          # noqa: E402
     Linear, RMSNorm, RoPE, SwiGLU, CausalAttention, CrossEntropy,
     rope_tables, causal_mask_rect, causal_mask)
-from tianji.l4_deltanet import GatedDeltaNet, CausalConv1D, L2Norm   # noqa: E402
+from tianji.l4_deltanet import (        # noqa: E402
+    GatedDeltaNet, CausalConv1D, L2Norm, gdn_parallel)
 from tianji.l5_moe import (                                 # noqa: E402
     MoELayer, LoadBalancer, sigmoid)
 from tianji.l6_optimizer import Muon, Muon2, orthogonalization_quality  # noqa: E402
@@ -214,6 +215,18 @@ def test_gdn_matches_naive_definition():
             + bt * vt[..., :, None] * kt[..., None, :]
         assert np.allclose(o[:, :, t, :], np.einsum("bhvk,bhk->bhv", S, q[:, :, t, :]),
                            atol=1e-12)
+
+
+def test_gdn_parallel_equals_recurrent():
+    """Gated DeltaNet 的并行前缀扫描形式 vs 递推形式，逐位一致（门禁 G11 的单元级复检）。"""
+    g = rng(120)
+    B, H, T, D = 2, 3, 11, 6
+    q, k, v = (g.standard_normal((B, H, T, D)) for _ in range(3))
+    beta = g.random((B, H, T))
+    alpha = g.random((B, H, T))
+    rec = GatedDeltaNet().forward(Ctx(), q, k, v, beta, alpha)
+    par = gdn_parallel(q, k, v, beta, alpha)
+    assert np.allclose(rec, par, atol=1e-9)
 
 
 def test_gdn_state_bounded():

@@ -54,7 +54,8 @@ import numpy as np
 from .l1_contract import Ctx, Module
 
 __all__ = ["GatedDeltaNet", "CausalConv1D", "l2norm", "L2Norm",
-           "gdn_init_state", "gdn_step", "gdn_decode_recurrent"]
+           "gdn_init_state", "gdn_step", "gdn_decode_recurrent",
+           "gdn_parallel", "gdn_compose", "gdn_scan_inclusive"]
 
 
 # ---------------------------------------------------------------- L2 归一化
@@ -315,4 +316,84 @@ def gdn_decode_recurrent(q: np.ndarray, k: np.ndarray, v: np.ndarray,
     for t in range(T):
         o[:, :, t, :], S = gdn_step(S, q[:, :, t, :], k[:, :, t, :],
                                     v[:, :, t, :], beta[:, :, t], alpha[:, :, t])
+    return o
+
+
+# ---------------------------------------------------------------- 并行前缀扫描形式（门禁 G11）
+#
+# 站在谁之上（零重写）：
+#     线性注意力（含 Gated DeltaNet）的「并行训练形式」是硬件高效内核的基石 ——
+#     GLA / Mamba-2 / Gated DeltaNet 的 CUDA kernel 都用 chunkwise + 关联扫描
+#     （associative scan, Blelloch 1990）把 O(T) 递推写成可并行的前缀和。
+#     这里给出其纯 NumPy 参照实现，作为门禁 G11 的对照基准：证明「并行形式」
+#     与「递推形式」逐位等价 —— 这是线性注意力模型的决定性正确性质（D4 的
+#     算法级强化：不是同式重算，而是两条不同算法路径必须收敛到同一数值）。
+#
+# 递推：S_t = α_t S_{t-1} (I − β_t k_t k_tᵀ) + β_t v_t k_tᵀ
+# 每个时间步是仿射算子 F_t(S) = A_t S M_t + C_t，其中
+#     A_t = α_t I,   M_t = I − β_t k_t k_tᵀ,   C_t = β_t v_t k_tᵀ
+# 两算子「先 E 后 F」的合成：
+#     A' = A_F A_E,   M' = M_E M_F,   C' = A_F C_E M_F + C_F
+# 包含前缀 P_t = F_t ∘ … ∘ F_0 ⇒ S_t = P_t(0) = C_{P_t}，o_t = S_t q_t。
+# 下面用分治（work-efficient）并行前缀扫描实现，与顺序递推是不同算法路径。
+
+def gdn_compose(E, F):
+    """合成两个仿射算子（先 E 后 F）：返回新的 (A, M, C)。"""
+    A_E, M_E, C_E = E
+    A_F, M_F, C_F = F
+    A = A_F @ A_E
+    M = M_E @ M_F
+    C = A_F @ (C_E @ M_F) + C_F
+    return A, M, C
+
+
+def gdn_scan_inclusive(ops):
+    """分治并行包含前缀扫描：输入算子列表，返回每个前缀的合成算子。
+
+    与顺序递推（沿 t 累乘）是不同算法路径；work O(T log T)、depth O(log T)，
+    结构上对应 GPU 上 chunkwise 内核的关联扫描，而非单线程循环。
+    """
+    if len(ops) == 1:
+        return [ops[0]]
+    mid = len(ops) // 2
+    left = gdn_scan_inclusive(ops[:mid])
+    right = gdn_scan_inclusive(ops[mid:])
+    last_left = left[-1]
+    return left + [gdn_compose(last_left, r) for r in right]
+
+
+def gdn_parallel(q: np.ndarray, k: np.ndarray, v: np.ndarray,
+                 beta: np.ndarray, alpha: np.ndarray) -> np.ndarray:
+    """Gated DeltaNet 的并行前缀扫描形式（对照 `forward` 的递推实现）。
+
+    q,k,v : (B, H, T, D)   beta,alpha : (B, H, T)
+    返回 o : (B, H, T, D)
+
+    对每个 (b,h) 独立构造 T 个仿射算子，做包含前缀扫描，再取 C_{P_t} 作为 S_t。
+    """
+    q = np.asarray(q, dtype=np.float64)
+    k = np.asarray(k, dtype=np.float64)
+    v = np.asarray(v, dtype=np.float64)
+    beta = np.asarray(beta, dtype=np.float64)
+    alpha = np.asarray(alpha, dtype=np.float64)
+    B, H, T, D = q.shape
+    kh = l2norm(k)
+    eye = np.eye(D)
+    o = np.zeros((B, H, T, D), dtype=np.float64)
+    for b in range(B):
+        for h in range(H):
+            ops = []
+            for t in range(T):
+                a = alpha[b, h, t]
+                bt = beta[b, h, t]
+                kt = kh[b, h, t]
+                vt = v[b, h, t]
+                A = a * eye
+                M = eye - bt * np.outer(kt, kt)
+                C = bt * np.outer(vt, kt)
+                ops.append((A, M, C))
+            pref = gdn_scan_inclusive(ops)
+            for t in range(T):
+                S_t = pref[t][2]                       # C_{P_t} = S_t（S_{-1}=0）
+                o[b, h, t] = S_t @ q[b, h, t]
     return o

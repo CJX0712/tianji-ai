@@ -12,7 +12,7 @@
     L7  训练          调度 / 数据管道 / 梯度累积 / 度量
     L8  推理          KV cache / 量化 / 投机解码
     L9  对齐          DPO / IPO / SimPO / KTO
-    L10 微指令+门禁   1024 条可执行微指令 + 10 道交付门禁
+    L10 微指令+门禁   1024 条可执行微指令 + 11 道交付门禁
 
 快速开始：
     >>> from tianji import TianjiConfig, TianjiModel, init_params
@@ -52,7 +52,7 @@ from .verify import run_all_gates, GateReport, GateResult
 
 __version__ = "1.0.0"
 __author__ = "晨星 (Chenxing)"
-__license__ = "Apache-2.0"
+__license__ = "MIT"
 
 __all__ = [
     # L0
