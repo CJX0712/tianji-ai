@@ -297,11 +297,11 @@ Top-p（nucleus）采样。
 ### `generate(model, prompt, max_new=32, *, temperature=1.0, top_p=0.9, seed=0, use_cache=True) -> list[int]`
 自回归生成。全注意力层启用 KV cache（GDN 层仍整序列重算，见"已知边界"）。
 
-### `speculative_decode(model, prompt, max_new=32, *, gamma=3, temperature=1.0, top_p=0.9, seed=0) -> (ids, SpecStats)`
+### `speculative_decode(model, prompt, max_new=32, *, gamma=1, temperature=1.0, top_p=0.9, seed=0) -> (ids, SpecStats)`
 用 MTP 头做 draft、主模型验证。接受概率 `min(1, p_target/p_draft)`，
 拒绝时从残差分布 `∝ max(0, p_target − p_draft)` 重采样 —— **数学上严格无损**。
 
-`SpecStats`：`drafted, accepted, accept_rate, speedup`。
+`SpecStats`：`drafted, accepted, accept_rate, speedup`（speedup 为每验证步产出 token 数，本后端结构性 ≈1——draft 搭车主干 forward，真实加速需独立轻量 draft + GPU batch 验证，见 G14 诚实边界）。无损性由 G14 机检。
 
 ---
 
@@ -443,7 +443,7 @@ from tianji import TINY_TALE, default_corpus, markov_tokens
 from tianji import run_all_gates, GateReport, GateResult
 rep = run_all_gates(seed=0, steps=40)
 print(rep.table())        # G1..G10 的 PASS/FAIL 与实测值
-rep.all_green             # 是否 13/13
+rep.all_green             # 是否 14/14
 ```
 
 ---
@@ -451,7 +451,7 @@ rep.all_green             # 是否 13/13
 ## 命令行
 
 ```bash
-python -m tianji.cli gates      # 13 道交付门禁
+python -m tianji.cli gates      # 14 道交付门禁
 python -m tianji.cli test       # 模块梯度检验冒烟
 python -m tianji.cli bench      # 完整基准
 python -m tianji.cli microops   # 微指令统计（--show 列出全部家族）

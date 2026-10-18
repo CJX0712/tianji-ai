@@ -24,7 +24,8 @@ from tianji.l5_moe import (                                 # noqa: E402
     MoELayer, LoadBalancer, sigmoid)
 from tianji.l6_optimizer import Muon, Muon2, orthogonalization_quality  # noqa: E402
 from tianji.l7_train import cosine_schedule, wsd_schedule, DataLoader   # noqa: E402
-from tianji.l8_infer import quantize_per_channel, quantize_groupwise, dequantize  # noqa: E402
+from tianji.l8_infer import (                               # noqa: E402
+    quantize_per_channel, quantize_groupwise, dequantize, speculative_decode)
 from tianji.l10_microops import MICROOPS, FAMILIES, run_all as micro_all  # noqa: E402
 from tianji.model import TianjiConfig, TianjiModel, init_params, build_layer_layout  # noqa: E402
 from tianji.verify import run_all_gates                     # noqa: E402
@@ -529,6 +530,56 @@ def test_microops_all_runnable():
     r = micro_all(seed=0)
     assert r["failed"] == [], r["failed"][:5]
     assert r["ok"] == 1024
+
+
+# ============================================================ L8 投机解码
+
+def test_spec_decode_residual_identity():
+    """单步拒绝采样恒等：输出分布逐点 == target，与 draft 好坏无关（64 组对抗分布）。"""
+    g = rng(spawn_seed(7, "spec_id"))
+    for trial in range(64):
+        V = int(g.integers(2, 25))
+        lp = g.standard_normal(V) * g.uniform(0.5, 3.0)
+        lq = g.standard_normal(V) * g.uniform(0.5, 3.0)
+        if trial % 4 == 1:
+            lq = lp.copy()                                   # draft == target（恒接受）
+        elif trial % 4 == 2:
+            lp[int(g.integers(0, V))] = -40.0                # target 含近零质量
+        elif trial % 4 == 3:
+            lq = g.standard_normal(V) + 3.0                  # draft 高度集中
+        p, q = softmax(lp), softmax(lq)
+        acc = q * np.minimum(1.0, p / np.maximum(q, 1e-300))
+        rej = 1.0 - acc.sum()
+        r = np.maximum(p - q, 0.0)
+        rs = r.sum()
+        out = acc + (rej * r / rs if rs > 1e-12 else 0.0)
+        assert np.max(np.abs(out - p)) < 1e-12, f"trial={trial} 恒等被破坏"
+
+
+def test_spec_decode_statistical_lossless():
+    """端到端统计无损：mock 双分布模型 6000 token，经验边际 TV<0.05；接受率 ∈ (0,1)。"""
+    from types import SimpleNamespace
+    V = 12
+    pb = np.arange(V, dtype=np.float64) * 0.7 - 3.0
+    pq = np.concatenate([np.full(3, 2.0), np.full(V - 3, -2.0)])   # draft 偏斜
+    p = softmax(pb)
+
+    class _Mock:
+        cfg = SimpleNamespace(mtp_depth=1)
+
+        def forward(self, x, **kw):
+            L = x.shape[1]
+            return {"logits": np.broadcast_to(pb, (1, L, V)).copy(),
+                    "mtp_logits": np.broadcast_to(pq, (1, L, V)).copy(), "aux": {}}
+
+    ids, st = speculative_decode(_Mock(), np.asarray([[0]], dtype=np.int64),
+                                 6000, gamma=1, seed=11)
+    gen = np.asarray(ids[1:], dtype=np.int64)
+    assert gen.size == 6000
+    tv = 0.5 * float(np.abs(np.bincount(gen, minlength=V) / gen.size - p).sum())
+    assert tv < 0.05, f"经验边际偏离 target：TV={tv:.4f}"
+    assert 0.0 < st.accept_rate < 1.0, f"接受率无效：{st.accept_rate}"
+    assert st.accepted >= 1
 
 
 # ============================================================ 门禁

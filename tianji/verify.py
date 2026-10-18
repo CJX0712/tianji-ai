@@ -24,16 +24,22 @@
     G13 chunkwise 反向等价 Gated DeltaNet 物化全量状态反向 vs FlashAttention 式重计算反向
                     （只存 O(T/C) 块入口状态）；两条不同资源/算法路径给同一解析梯度，
                     再用中心差分（gradcheck）做完全独立裁判
+    G14 投机解码无损 Leviathan/Chen 拒绝采样的决定性恒等式：单步输出分布逐点等于 target，
+                    与 draft 好坏无关。双验证：(a) 解析恒等（64 组随机分布，含
+                    draft==target / target 含零 / draft 高度集中，机器精度）；
+                    (b) 端到端统计（mock 双分布模型 6000 token，经验边际 TV 距离）
+                    + 接受率 ∈ (0,1)（I5 有效性）。加速边界如实声明（结构性 ≈1）
 """
 
 from __future__ import annotations
 
 import time
 from dataclasses import dataclass, field
+from types import SimpleNamespace
 
 import numpy as np
 
-from .l0_numerics import spawn_seed, rng, newton_schulz
+from .l0_numerics import spawn_seed, rng, newton_schulz, softmax
 from .l6_optimizer import orthogonalization_quality, Muon, Muon2
 from .l7_train import DataLoader, Trainer
 from .l8_infer import quantize_per_channel, quantize_groupwise, dequantize
@@ -373,6 +379,65 @@ def run_all_gates(seed: int = 0, steps: int = 60, verbose: bool = True) -> GateR
     add("chunkwise 反向等价", worst < 1e-9,
         f"Gated DeltaNet 物化反向 vs chunkwise 重计算反向（T={Tg}, 6 种块长）最大差 {worst:.2e}",
         diff=worst)
+    R.results[-1].seconds = time.time() - t0
+
+    # ---------------------------------------------------------- G14 投机解码无损
+    # Leviathan/Chen 拒绝采样的决定性恒等式：单步输出分布逐点等于 target，
+    # 与 draft 好坏无关 —— 这是「加速却不损失质量」的数学根据。
+    # (a) 解析验证：P(out=x) = q·min(1,p/q) + P_rej·residual == p，机器精度；
+    #     覆盖四种对抗情形：任意分布 / draft==target（恒接受）/ target 含近零
+    #     质量 / draft 高度集中（大量拒绝）。
+    # (b) 端到端统计：mock 双分布模型跑 6000 token，经验边际与 target 的
+    #     总变差距离 TV 必须小；且 draft≠target 时接受率 ∈ (0,1)（I5 有效性）。
+    t0 = time.time()
+    from .l8_infer import speculative_decode as _spec
+    g14 = rng(spawn_seed(seed, "g14a"))
+    worst14 = 0.0
+    for trial in range(64):
+        V = int(g14.integers(2, 25))
+        lp = g14.standard_normal(V) * g14.uniform(0.5, 3.0)
+        lq = g14.standard_normal(V) * g14.uniform(0.5, 3.0)
+        if trial % 4 == 1:
+            lq = lp.copy()                                   # draft == target（恒接受）
+        elif trial % 4 == 2:
+            lp[int(g14.integers(0, V))] = -40.0              # target 含近零质量
+        elif trial % 4 == 3:
+            lq = g14.standard_normal(V) + 3.0                # draft 高度集中
+        p = softmax(lp)
+        q = softmax(lq)
+        acc = q * np.minimum(1.0, p / np.maximum(q, 1e-300))
+        rej = 1.0 - acc.sum()
+        r = np.maximum(p - q, 0.0)
+        rs = r.sum()
+        out = acc + (rej * r / rs if rs > 1e-12 else 0.0)
+        worst14 = max(worst14, float(np.max(np.abs(out - p))))
+    # ---- (b) mock 双分布模型端到端统计
+    Vb = 12
+    pb_logits = np.arange(Vb, dtype=np.float64) * 0.7 - 3.0
+    pq_logits = np.concatenate([np.full(3, 2.0), np.full(Vb - 3, -2.0)])   # draft 偏斜
+    p_b = softmax(pb_logits)
+
+    class _MockSpec:
+        """任何上下文都返回同一 target/draft logits 的 mock（使理论边际解析已知）。"""
+        cfg = SimpleNamespace(mtp_depth=1)
+
+        def forward(self, x, **kw):
+            L = x.shape[1]
+            return {"logits": np.broadcast_to(pb_logits, (1, L, Vb)).copy(),
+                    "mtp_logits": np.broadcast_to(pq_logits, (1, L, Vb)).copy(),
+                    "aux": {}}
+
+    ids14, st14 = _spec(_MockSpec(), np.asarray([[0]], dtype=np.int64),
+                        6000, gamma=1, seed=11)
+    gen = np.asarray(ids14[1:], dtype=np.int64)
+    freq = np.bincount(gen, minlength=Vb) / gen.size
+    tv = 0.5 * float(np.abs(freq - p_b).sum())
+    ok14 = (worst14 < 1e-12 and tv < 0.05
+            and 0.0 < st14.accept_rate < 1.0 and st14.accepted >= 1)
+    add("投机解码无损", ok14,
+        f"解析恒等最大差 {worst14:.2e}；6000 token 经验边际 TV={tv:.4f}；"
+        f"接受率 {st14.accept_rate:.3f}（∈(0,1) 有效 drafting；加速边界结构性 ≈1 已如实声明）",
+        analytic=worst14, tv=tv, accept_rate=st14.accept_rate)
     R.results[-1].seconds = time.time() - t0
 
     return R

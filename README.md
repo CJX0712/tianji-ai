@@ -103,7 +103,7 @@ the quick brown fox. to be or not to be,
 | **L7** | 训练 | 余弦 / WSD 调度、梯度累积、梯度裁剪、bits-per-byte 度量 |
 | **L8** | 推理 | KV 状态缓存、per-channel INT8 / group-wise INT4、MTP 投机解码 |
 | **L9** | 对齐 | DPO / IPO / SimPO / KTO，统一走 `backward(g_logits=...)` 入口 |
-| **L10** | 微指令 + 门禁 | **1024 条可执行微指令**（32 家族 × 32）+ 13 道交付门禁 |
+| **L10** | 微指令 + 门禁 | **1024 条可执行微指令**（32 家族 × 32）+ 14 道交付门禁 |
 
 完整推导与逐层详解见 [ARCHITECTURE.md](ARCHITECTURE.md)。
 
@@ -137,6 +137,7 @@ Pre-RMSNorm → Mixer(GDN 或 MLA) → 残差 → Pre-RMSNorm → FFN(MoE 或 De
 | G11 并行形式等价 | Gated DeltaNet 递推 vs 并行前缀扫描（associative scan）两条算法路径逐位一致 | 8.88e-16 |
 | G12 chunkwise 等价 | Gated DeltaNet 递推 vs chunkwise 分块并行（块内并行+块间递推，真实 GPU 内核训练形式），含不整除尾块 | 8.88e-16 |
 | G13 chunkwise 反向等价 | Gated DeltaNet 物化全量状态反向 vs FlashAttention 式重计算反向（只存 O(T/C) 块入口状态），两条资源/算法路径给同一解析梯度，中心差分独立裁判 | 4.44e-15 |
+| G14 投机解码无损 | Leviathan/Chen 拒绝采样恒等：单步输出分布逐点==target（64 组对抗分布解析验证）+ 6000 token 端到端统计 + 接受率∈(0,1)；加速边界如实声明（结构性 ≈1） | 2.22e-16 / TV=0.0088 |
 
 **门禁的态度：失败就如实报失败，不允许放宽阈值凑绿。**
 
@@ -163,7 +164,7 @@ Pre-RMSNorm → Mixer(GDN 或 MLA) → 残差 → Pre-RMSNorm → FFN(MoE 或 De
 | A12 | 推理吞吐 | > 50 tok/s | **465 tok/s** |
 | A13 | 运行时依赖 | == 1 | **`['numpy']`** |
 | A14 | 单元测试 | 41/41 | **41/41** |
-| A15 | 交付门禁 | 13/13 | **13/13** |
+| A15 | 交付门禁 | 14/14 | **14/14** |
 | A16 | 断网可运行 | 0 处网络依赖 | **0** |
 
 三条判据的设定依据（A3 为何是 10%、A7 为何用权重误差、A8 为何放宽到 15%）
@@ -193,7 +194,7 @@ python scripts/quickstart.py          # 最小示例，约 10 秒
 2. 模型   4 层 布局=LLLA (A=MLA, L=GatedDeltaNet)，参数 252,032
 4. 训练   30 步 2.4s，loss 6.8636 -> 0.2036
 6. 生成   结果='the quick brown fox jumps over the lazy dog. ...'
-7. 门禁   13/13 通过
+7. 门禁   14/14 通过
 ✅ 全部通过
 ```
 
@@ -240,8 +241,8 @@ make verify-all        # 测试 + 门禁 + 最小示例（交付自查）
 
 ```bash
 docker build -t tianji:latest .
-docker run --rm tianji:latest gates      # 跑 13 道门禁
-docker run --rm tianji:latest test       # 跑 42 个测试
+docker run --rm tianji:latest gates      # 跑 14 道门禁
+docker run --rm tianji:latest test       # 跑 45 个测试
 
 docker compose run --rm tianji train     # 训练，产物落在 ./runs
 docker compose run --rm tianji generate  # 推理
@@ -278,8 +279,8 @@ python bench/run_bench.py --steps 120 --seed 0     # 约 2 分钟，写 bench/re
 
 ```bash
 make help          # 查看全部目标
-make test          # 42 个单元测试
-make gates         # 13 道交付门禁
+make test          # 45 个单元测试
+make gates         # 14 道交付门禁
 make bench         # 完整基准
 make quickstart    # 最小示例
 make train         # 训练
@@ -356,7 +357,7 @@ NumPy 2.5.4 纯 CPU、合成 2 阶马尔可夫语料（vocab=64）、d_model=64 
 | 训练 | ✅ CPU 可训 | ✅ GPU | ❌ | ✅ GPU |
 | 量化 / 投机解码 | ✅ | ❌ | ✅ | ❌ |
 | 对齐（DPO 等） | ✅ | ❌ | ❌ | ❌ |
-| **可证门禁** | **✅ 13 道** | ❌ | ❌ | 部分 |
+| **可证门禁** | **✅ 14 道** | ❌ | ❌ | 部分 |
 | 吞吐 | 低（NumPy CPU） | 高 | 极高 | 极高 |
 
 **诚实的结论**：本项目**不追求吞吐**。它的对标对象是「正确性可独立验证的研究级实现」，
@@ -460,7 +461,7 @@ tianji-ai/
 │   ├── model.py               3:1 混合模型组装
 │   ├── persist.py             checkpoint 保存/加载 + sha256 校验
 │   ├── data.py                内置离线语料
-│   ├── verify.py              13 道交付门禁
+│   ├── verify.py              14 道交付门禁
 │   └── cli.py                 命令行入口
 ├── scripts/
 │   ├── reproduce.sh             一键复现（Linux / macOS，无需 Docker）
@@ -472,7 +473,7 @@ tianji-ai/
 │   └── test_model.py            模型配置冒烟
 ├── docs/
 │   └── API.md                   完整 API 说明（L0–L10 全部接口）
-├── tests/test_all.py          42 个单元测试
+├── tests/test_all.py          45 个单元测试
 ├── bench/                     基准脚本 + 结果（bench.json）
 ├── Dockerfile                 一键环境（python:3.11-slim）
 ├── docker-compose.yml         挂载 ./runs 的训练/推理
@@ -510,7 +511,7 @@ tianji-ai/
 - **没有 GPU 路径**：纯 NumPy CPU 实现，模型规模在百万参数以下。
 - **1024 条微指令中**，17 个家族（`FAMILY_KIND = "sweep"`）的成员是同一算子的参数扫描，
   用于覆盖数值边界，不是 1024 个语义独立算子。这个区分在代码里显式标注。
-- **投机解码的 2.0 token/轮是 γ=1 下的理论上限**，不是真实加速比（见 BENCHMARKS.md）。
+- **投机解码的加速边界（诚实声明）**：本实现的 draft 搭车主模型 forward（MTP 头依赖主干 hidden），每验证 1 个 token 恰需 1 次 forward，加速比**结构性 ≈1**；无损性（输出分布严格等于 target）由 **G14** 机检（解析恒等最大差 2.22e-16 + 6000 token 统计 TV=0.0088）。真实加速（论文的 1+接受率）需要独立轻量 draft 模型 + GPU batch 并行验证 γ 个 draft，属 GPU 路径，见 BENCHMARKS.md。
 
 ---
 

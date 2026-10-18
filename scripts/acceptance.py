@@ -349,7 +349,7 @@ def a14():
 
 def a15():
     rep = run_all_gates(seed=0, steps=30)
-    record("A15", "交付门禁", rep.all_green, f"{rep.passed}/{rep.total}", "13/13 全绿")
+    record("A15", "交付门禁", rep.all_green, f"{rep.passed}/{rep.total}", "14/14 全绿")
 
 
 # ---------------------------------------------------------------- A16 断网

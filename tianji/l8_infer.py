@@ -21,8 +21,12 @@
     I1 KV cache 等价：增量解码的 logits == 整序列重算的 logits（1e-10）
     I2 量化误差有界：INT8 的相对 Frobenius 误差 < 2^-7 量级；INT4 < 2^-3 量级
     I3 量化单调性：INT8 的困惑度退化 <= INT4 的困惑度退化
-    I4 投机解码无损：**期望输出分布与逐一解码一致**（这是投机解码的核心定理）
-    I5 投机解码有效：接受率 > 0（draft 至少有时被接受）
+    I4 投机解码无损：**期望输出分布与逐一解码一致**（G14 机检：解析恒等 + 统计端到端）
+    I5 投机解码有效：接受率 ∈ (0,1)（draft≠target 时确实在 draft，G14 机检）；
+                    加速比在本后端结构性 ≈1 —— draft 搭车主干 forward（MTP 头依赖
+                    主干 hidden），每验证 1 token 恰需 1 次 forward；真实加速（论文的
+                    1+α）需要独立轻量 draft + 一次 batch 并行验证（GPU 场景）。
+                    **不虚报加速，如实机检无损性**（宣称必有门禁守护）
 """
 
 from __future__ import annotations
@@ -169,26 +173,41 @@ class SpecStats:
 
     @property
     def speedup(self) -> float:
-        """每次验证循环平均产出的 token 数（理论加速上界的经验估计）。"""
-        return (self.accepted + self.steps) / max(self.steps, 1)
+        """平均每验证步产出的 token 数。
+
+        本后端（draft 搭车主干 forward）结构性 ≈1：每验证 1 个 draft 恰需
+        1 次主干 forward。真实加速（论文的 1+接受率）需要独立轻量 draft
+        模型 + 一次 batch 并行验证 γ 个 token（GPU 场景）—— 详见 G14 门禁
+        的诚实边界说明。保留此字段以兼容 bench，值如实反映 ≈1。
+        """
+        return (self.accepted + self.steps - self.accepted) / max(self.steps, 1)
 
 
 def speculative_decode(model, prompt: np.ndarray, max_new: int = 32, *,
-                       gamma: int = 3, temperature: float = 1.0, top_p: float = 0.9,
+                       gamma: int = 1, temperature: float = 1.0, top_p: float = 0.9,
                        seed: int = 0) -> tuple[list[int], SpecStats]:
-    """用 MTP 头做 draft、主模型并行验证的投机解码（DeepSeek-V3 的用法）。
+    """用 MTP 头做 draft、主模型逐位拒绝采样验证的投机解码。
 
-    为什么这样是无损的：
-        投机解码的核心定理是「draft-then-verify 的输出分布与逐一采样
-        严格相同」。做法是把 draft 的 token 与目标分布的比值作为接受概率：
-            accept ~ U(0,1) < min(1, p_target(x) / p_draft(x))
-        被拒绝时从「修正后的残差分布」重采样。这样在数学上等价于
-        直接从 p_target 采样，加速却完全不损失质量。
+    站在谁之上（零重写）：
+        Leviathan et al. 2023 (ICML) / Chen et al. 2023 的 draft-then-verify
+        拒绝采样；DeepSeek-V3 把 MTP 头当 draft 使用。
 
-    实现说明：
-        本实现用 MTP 头给出的 logits 作为 draft 分布（V3 原义）。
-        draft 的采样是逐 token 的（因为 MTP 头只预测下 1~2 个 token），
-        因此 gamma 实际受 cfg.mtp_depth 限制；这里按 min(gamma, mtp_depth) 取。
+    无损性（G14 机检，这是投机解码的核心定理）：
+        每步从 draft 分布 q 采样 xd，以 min(1, p(xd)/q(xd)) 的概率接受；
+        拒绝时从残差分布 ∝ max(0, p−q) 重采样。由恒等式
+            Σ_x min(p(x), q(x)) = 1 − Σ_x max(p(x)−q(x), 0)
+        可得单步输出分布**逐点等于** p —— 无论 draft 多差都严格无损：
+            P(out=x) = q(x)·min(1, p/q) + P(拒绝)·residual(x) = p(x)。
+
+    诚实的加速边界（宣称必有门禁守护）：
+        本实现的 draft 分布搭车主模型 forward（MTP 头依赖主干 hidden），
+        每验证 1 个 token 恰需 1 次主干 forward，加速比结构性 ≈1。
+        论文的 1+α 加速需要「独立轻量 draft 模型 + 一次 batch 并行验证
+        γ 个 draft」（GPU 场景 batch 收益）。本后端（CPU+NumPy，forward
+        成本 ∝ 序列长）下 batch 无收益，因此只兑现无损性并机检之，不虚报。
+
+    gamma 说明：
+        cfg.mtp_depth=1（MTP 单步预测）→ 有效 γ=1；更大的 gamma 被夹到 1。
     """
     if model.cfg.mtp_depth <= 0:
         ids = generate(model, prompt, max_new, temperature=temperature, top_p=top_p, seed=seed)
@@ -197,38 +216,25 @@ def speculative_decode(model, prompt: np.ndarray, max_new: int = 32, *,
     ids = list(np.asarray(prompt).reshape(-1).tolist())
     st = SpecStats()
     g = np.random.default_rng(spawn_seed(seed, "spec"))
-    gamma = max(1, min(int(gamma), model.cfg.mtp_depth))
+    T = temperature if temperature else 1.0
+    prompt_len = len(ids)
     produced = 0
-    while produced < max_new:
-        x = np.asarray([ids], dtype=np.int64)
-        out = model.forward(x)
-        p_main = softmax(out["logits"][0, -1] / (temperature or 1.0))
-        # ---- draft：用 MTP 头给出下一个 token 的分布
-        p_draft = p_main
-        if out.get("mtp_logits") is not None:
-            p_draft = softmax(out["mtp_logits"][0, -1] / (temperature or 1.0))
-        # ---- 逐一验证（gamma=1 时退化为标准采样，仍严格无损）
-        for _ in range(min(gamma, max_new - produced)):
-            xd = int(g.choice(len(p_draft), p=p_draft))
-            st.drafted += 1
-            if g.random() < min(1.0, p_main[xd] / max(p_draft[xd], 1e-12)):
-                ids.append(xd)
-                produced += 1
-                st.accepted += 1
-                # 接受后再走一步主模型，刷新 p_main / p_draft
-                out = model.forward(np.asarray([ids], dtype=np.int64))
-                p_main = softmax(out["logits"][0, -1] / (temperature or 1.0))
-                p_draft = p_main
-            else:
-                # 被拒：从修正后的残差分布 ∝ max(0, p_main − p_draft) 重采样
-                resid = np.maximum(p_main - p_draft, 0.0)
-                if resid.sum() <= 1e-12:
-                    resid = p_main
-                resid = resid / resid.sum()
-                ids.append(int(g.choice(len(resid), p=resid)))
-                produced += 1
-                break
+    while produced < max_new and st.steps < max_new * 4:    # 安全阀防死循环
+        out = model.forward(np.asarray([ids], dtype=np.int64))
+        p = softmax(out["logits"][0, -1] / T)               # 验证分布（target）
+        q = softmax(out["mtp_logits"][0, -1] / T)           # draft 分布（MTP 头）
         st.steps += 1
-        if st.steps > max_new * 2:      # 安全阀，防止 draft 全拒时死循环
-            break
-    return ids[:len(np.asarray(prompt).reshape(-1)) + max_new], st
+        xd = int(g.choice(len(q), p=q))
+        st.drafted += 1
+        if g.random() < min(1.0, p[xd] / max(q[xd], 1e-300)):
+            ids.append(xd)
+            produced += 1
+            st.accepted += 1
+        else:
+            # 拒绝：从残差分布 ∝ max(0, p−q) 重采样（无损性的另一半）
+            resid = np.maximum(p - q, 0.0)
+            s = resid.sum()
+            resid = p if s <= 1e-12 else resid / s          # p==q 时恒接受，此为数值保护
+            ids.append(int(g.choice(len(resid), p=resid)))
+            produced += 1
+    return ids[:prompt_len + max_new], st
