@@ -39,6 +39,14 @@
                            真实 GPU 内核的分块本质，见本文件末尾）
     三者必须逐位一致：G11 机检 (1)≡(2)，G12 机检 (1)≡(3)，实测最大差均 8.88e-16。
 
+反向也有三条互证路径（同一解析梯度，不同资源/算法路径，由门禁机检）：
+    1. `GatedDeltaNet.backward` —— 物化全量状态 S_all（形状 B×H×(T+1)×D×D，显存杀手）
+    2. `gdn_chunkwise_backward` —— FlashAttention 式**重计算而非物化**：只存 O(T/C) 个
+       块入口状态，块内状态在反向时即时重算（块间用块算子伴随传输 G），把显存从 O(T·D²)
+       压到 O((T/C)·D²)；这是真实 GPU chunkwise 内核反向的精髓（见本文件末尾）
+    3. 中心差分 `gradcheck`（有限差分）—— 与解析反向完全独立，做最终裁判
+    G13 机检 (1)≡(2)（两条解析反向逐位一致），单测再用 gradcheck 守 (2)≡(3)。
+
 为什么不用**论文原版** chunkwise（WY 表示 + UT transform）：
     那是为 GPU 设计的 —— 它把 T×T 的递推换成块内矩阵乘 + 块间递推，
     代价是需要求 (I − 三角矩阵)⁻¹ 与额外的 d×d 中间矩阵。在 CPU + NumPy 后端下
@@ -62,7 +70,7 @@ from .l1_contract import Ctx, Module
 __all__ = ["GatedDeltaNet", "CausalConv1D", "l2norm", "L2Norm",
            "gdn_init_state", "gdn_step", "gdn_decode_recurrent",
            "gdn_parallel", "gdn_compose", "gdn_scan_inclusive",
-           "gdn_chunkwise"]
+           "gdn_chunkwise", "gdn_chunkwise_backward", "GatedDeltaNetChunkwise"]
 
 
 # ---------------------------------------------------------------- L2 归一化
@@ -480,3 +488,166 @@ def gdn_chunkwise(q: np.ndarray, k: np.ndarray, v: np.ndarray,
                 A_b, M_b, C_b = bo
                 S_start = A_b @ S_start @ M_b + C_b   # 块到块：递推步数 O(T/C)
     return o
+
+
+# ---------------------------------------------------------------- chunkwise 反向（门禁 G13）
+#
+# 站在谁之上（零重写）：
+#     FlashAttention / flash-linear-attention 的内核反向精髓是「重计算而非物化全量状态」：
+#     前向只存块入口状态（O(T/C) 个），反向时在块内即时重算每个时间步的 S_t，块间用
+#     块算子的伴随（adjoint）把状态伴随 G 从块尾传回块头。这与 `GatedDeltaNet.backward`
+#    物化全部 S_all（B×H×(T+1)×D×D）是**不同的资源/算法路径**，但解析梯度必须逐位一致。
+#
+# 数学（与 forward 的仿射算子 F_t(S)=A_t S M_t + C_t 严格对偶）：
+#     状态伴随 G_t = ∂L/∂S_t；来自 o_t=S_t q_t 的直接贡献 G_t += g_t q_tᵀ。
+#     跨步伴随（反向递推）：G_{t-1} = A_tᵀ G_t M_tᵀ = α_t(G_t − β_t(G_t k_t)k_tᵀ)
+#        （A_t=α_t I 对称、M_t=I−β_t k_t k_tᵀ 对称 ⇒ 转置即自身）
+#     参数梯度（k 为 L2 归一化后的 k̂，与 forward 完全一致）：
+#        ∂L/∂v_t = β_t G_t k_t,   ∂L/∂q_t = S_tᵀ g_t,
+#        ∂L/∂k̂_t = −α_tβ_t[S_{t-1}ᵀ(G_t k_t) + G_tᵀ P_t] + β_t G_tᵀ v_t,  P_t=S_{t-1}k_t
+#        ∂L/∂β_t = ⟨G_t, −α_t P_t k_tᵀ + v_t k_tᵀ⟩,   ∂L/∂α_t = ⟨G_t, S_{t-1} − β_t P_t k_tᵀ⟩
+#     最后经 L2Norm 反向把 ∂L/∂k̂_t 折回 ∂L/∂k_t，与 materialized backward 完全对齐。
+#
+# 显存对比（核心收益）：materialized 存 T+1 个 (D×D) 状态；本实现只存块入口状态
+# O((T/C)·D²) + 块内临时 O(C·D²)。C<<T 时省一个数量级，且峰值恒定、与序列长度解耦。
+
+def gdn_chunkwise_backward(q: np.ndarray, k: np.ndarray, v: np.ndarray,
+                           beta: np.ndarray, alpha: np.ndarray,
+                           grad_out: np.ndarray, chunk: int = 4):
+    """Gated DeltaNet 的 chunkwise（分块并行）反向。
+
+    与 `GatedDeltaNet.backward` 的物化全量状态实现是不同算法路径，但解析梯度
+    必须逐位一致（门禁 G13 机检）。返回 (dq, dk, dv, dbeta, dalpha)，形状与
+    `GatedDeltaNet.backward` 完全相同，可直接对照。
+
+    grad_out : g = ∂L/∂o，形状 (B, H, T, D)
+    """
+    q = np.asarray(q, dtype=np.float64)
+    k = np.asarray(k, dtype=np.float64)
+    v = np.asarray(v, dtype=np.float64)
+    beta = np.asarray(beta, dtype=np.float64)
+    alpha = np.asarray(alpha, dtype=np.float64)
+    g = np.asarray(grad_out, dtype=np.float64)
+    B, H, T, D = q.shape
+    C = int(chunk)
+    if C < 1:
+        raise ValueError("chunk 必须 >= 1")
+    kh = l2norm(k)
+    eye_b = np.eye(D)[None, None]                      # (1,1,D,D) 广播到 (B,H,D,D)
+
+    dq = np.zeros_like(q)
+    dkh = np.zeros_like(kh)
+    dv = np.zeros_like(v)
+    dbeta = np.zeros((B, H, T), dtype=np.float64)
+    dalpha = np.zeros((B, H, T), dtype=np.float64)
+
+    # ---- 块边界（与 gdn_chunkwise 完全相同的切分，保证块入口状态一致）
+    starts: list[int] = []
+    idx = 0
+    while idx < T:
+        end = min(idx + C, T)
+        starts.append(idx)
+        idx = end
+    ends = [min(s + C, T) for s in starts]
+    nb = len(starts)
+
+    # ---- 前向：只存块入口状态 S_entry[ci] = 进入第 ci 块的 S_{start-1}（O(T/C) 存储）
+    #      用块算子 (A_b,M_b,C_b) 递推，无需物化任何中间 S_t。
+    S_entry = np.zeros((B, H, nb + 1, D, D), dtype=np.float64)
+    for ci in range(nb):
+        st, en = starts[ci], ends[ci]
+        A_b = M_b = C_b = None
+        for t in range(st, en):
+            kt = kh[:, :, t]
+            vt = v[:, :, t]
+            a = alpha[:, :, t][..., None, None]
+            b2 = beta[:, :, t][..., None, None]
+            A = a * eye_b
+            M = eye_b - b2 * (kt[:, :, :, None] * kt[:, :, None, :])
+            Cc = b2 * (vt[:, :, :, None] * kt[:, :, None, :])
+            if A_b is None:
+                A_b, M_b, C_b = A, M, Cc
+            else:
+                # 合成（先 E 后 F）：A'=A_F A_E, M'=M_E M_F, C'=A_F(C_E M_F)+C_F
+                A_b = A @ A_b
+                M_b = M_b @ M
+                C_b = A @ (C_b @ M) + Cc
+        S_entry[:, :, ci + 1] = A_b @ S_entry[:, :, ci] @ M_b + C_b
+
+    # ---- 反向：逆序过块；块内即时重算 S_t，块间用 G 直接携带（伴随已含在逐步递推里）
+    G = np.zeros((B, H, D, D), dtype=np.float64)        # 状态伴随 G_t，跨块连续携带
+    for ci in reversed(range(nb)):
+        st, en = starts[ci], ends[ci]
+        S_start = S_entry[:, :, ci]                     # S_{st-1}
+        # 块内前向重算（不物化）：S_t = F_t(S_{t-1})
+        S_prev = S_start
+        S_blk: list[np.ndarray] = []
+        for t in range(st, en):
+            kt = kh[:, :, t]
+            vt = v[:, :, t]
+            a = alpha[:, :, t][..., None, None]
+            b2 = beta[:, :, t][..., None, None]
+            A = a * eye_b
+            M = eye_b - b2 * (kt[:, :, :, None] * kt[:, :, None, :])
+            Cc = b2 * (vt[:, :, :, None] * kt[:, :, None, :])
+            S = A @ S_prev @ M + Cc
+            S_blk.append(S)
+            S_prev = S
+        # 块内逆序：累加 o 的直接贡献 → 算参数梯度 → 递推到上一步
+        for j in reversed(range(en - st)):
+            t = st + j
+            S_t = S_blk[j]
+            S_prev_t = S_blk[j - 1] if j > 0 else S_start
+            kt = kh[:, :, t]
+            vt = v[:, :, t]
+            qt = q[:, :, t]
+            gt = g[:, :, t]
+            b2 = beta[:, :, t][..., None, None]
+            a = alpha[:, :, t][..., None, None]
+            av = alpha[:, :, t][..., None]              # (B,H,1) 用于逐元素梯度累加
+            bv = beta[:, :, t][..., None]
+            G = G + gt[..., :, None] * qt[..., None, :]   # o_t = S_t q_t → G_t += g_t q_tᵀ
+            P = np.einsum("bhvk,bhk->bhv", S_prev_t, kt)        # S_{t-1} k_t
+            Gk = np.einsum("bhvk,bhk->bhv", G, kt)              # G_t k_t
+            GtP = np.einsum("bhvk,bhv->bhk", G, P)              # G_tᵀ P_t
+            GtV = np.einsum("bhvk,bhv->bhk", G, vt)             # G_tᵀ v_t
+            StGk = np.einsum("bhvk,bhv->bhk", S_prev_t, Gk)     # S_{t-1}ᵀ(G_t k_t)
+            dkh[:, :, t] = -av * bv * (StGk + GtP) + bv * GtV
+            dv[:, :, t] = bv * Gk
+            dq[:, :, t] = np.einsum("bhvk,bhv->bhk", S_t, gt)
+            term_b = (-av[..., None] * P[..., :, None] * kt[..., None, :]
+                      + vt[:, :, :, None] * kt[:, :, None, :])
+            dbeta[:, :, t] = np.einsum("bhvk,bhvk->bh", G, term_b)
+            term_a = S_prev_t - bv[..., None] * P[..., :, None] * kt[..., None, :]
+            dalpha[:, :, t] = np.einsum("bhvk,bhvk->bh", G, term_a)
+            # 跨步伴随：G_{t-1} = α_t(G_t − β_t(G_t k_t)k_tᵀ)  = A_tᵀ G_t M_tᵀ
+            G = a * (G - b2 * Gk[:, :, :, None] * kt[:, :, None, :])
+    # k 的 L2 归一化反向：∂L/∂k = (∂L/∂k̂ − k̂·⟨∂L/∂k̂, k̂⟩) / ‖k‖
+    n = np.linalg.norm(k, axis=-1, keepdims=True) + 1e-8
+    proj = np.sum(dkh * kh, axis=-1, keepdims=True)
+    dk = (dkh - kh * proj) / n
+    return dq, dk, dv, dbeta, dalpha
+
+
+class GatedDeltaNetChunkwise(Module):
+    """把 `gdn_chunkwise` / `gdn_chunkwise_backward` 包成 Module，供 gradcheck 独立裁判。
+
+    与 `GatedDeltaNet`（物化状态反向）是同一数学的两条实现路径；gradcheck 用完全
+    独立的中心差分做最终裁判，确保 chunkwise 反向不是「恰好等于另一条手写的反向」，
+    而是真的等于数值梯度。
+    """
+
+    differentiable = (0, 1, 2, 3, 4)
+
+    def __init__(self, chunk: int = 4):
+        self.chunk = int(chunk)
+
+    def forward(self, ctx: Ctx, q, k, v, beta, alpha) -> np.ndarray:
+        o = gdn_chunkwise(q, k, v, beta, alpha, chunk=self.chunk)
+        ctx.put(q=q, k=k, v=v, beta=beta, alpha=alpha)   # 反向重算时直接用原始输入
+        return o
+
+    def backward(self, ctx: Ctx, grad_out) -> tuple:
+        q, k, v, beta, alpha = ctx["q"], ctx["k"], ctx["v"], ctx["beta"], ctx["alpha"]
+        return gdn_chunkwise_backward(q, k, v, beta, alpha, grad_out, chunk=self.chunk)
+

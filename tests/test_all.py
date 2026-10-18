@@ -18,7 +18,8 @@ from tianji.l3_primitives import (                          # noqa: E402
     Linear, RMSNorm, RoPE, SwiGLU, CausalAttention, CrossEntropy,
     rope_tables, causal_mask_rect, causal_mask)
 from tianji.l4_deltanet import (        # noqa: E402
-    GatedDeltaNet, CausalConv1D, L2Norm, gdn_parallel, gdn_chunkwise)
+    GatedDeltaNet, CausalConv1D, L2Norm, gdn_parallel, gdn_chunkwise,
+    gdn_chunkwise_backward, GatedDeltaNetChunkwise)
 from tianji.l5_moe import (                                 # noqa: E402
     MoELayer, LoadBalancer, sigmoid)
 from tianji.l6_optimizer import Muon, Muon2, orthogonalization_quality  # noqa: E402
@@ -242,6 +243,38 @@ def test_gdn_chunkwise_equals_recurrent():
     for chunk in (1, 2, 4, 5, 16):
         assert np.allclose(rec, gdn_chunkwise(q, k, v, beta, alpha, chunk=chunk),
                            atol=1e-9), f"chunk={chunk} 不等价"
+
+
+def test_gdn_chunkwise_backward_equals_materialized():
+    """chunkwise 重计算反向 vs 物化全量状态反向逐位一致（门禁 G13 的单元级复检）。
+
+    两条不同的资源/算法路径（物化 S_all vs 只存 O(T/C) 块入口状态）必须给出同一个
+    解析梯度；T=23 故意不被 chunk 整除，覆盖尾块长度不足的路径。
+    """
+    g = rng(122)
+    B, H, T, D = 2, 3, 23, 6
+    q, k, v = (g.standard_normal((B, H, T, D)) for _ in range(3))
+    beta, alpha = g.random((B, H, T)), g.random((B, H, T))
+    gout = g.standard_normal((B, H, T, D))
+    ctx = Ctx()
+    GatedDeltaNet().forward(ctx, q, k, v, beta, alpha)
+    dmat = GatedDeltaNet().backward(ctx, gout)
+    for chunk in (1, 2, 3, 4, 8, 16, 23):
+        dcw = gdn_chunkwise_backward(q, k, v, beta, alpha, gout, chunk=chunk)
+        for a, b in zip(dmat, dcw):
+            assert np.allclose(a, b, atol=1e-9), f"chunk={chunk} 反向不等价"
+
+
+def test_gdn_chunkwise_backward_gradcheck():
+    """用完全独立的中心差分（gradcheck）裁判 chunkwise 反向 —— 确保不是「两条手写反向互抄」。"""
+    g = rng(123)
+    B, H, T, D = 2, 2, 9, 5
+    q, k, v = (g.standard_normal((B, H, T, D)) for _ in range(3))
+    beta = g.random((B, H, T))
+    alpha = g.random((B, H, T))
+    rep, _, _ = gradcheck(GatedDeltaNetChunkwise(chunk=4), [q, k, v, beta, alpha],
+                          seed=3, tol=1e-6, name="GDNChunkwise")
+    assert rep.passed, f"gradcheck 失败: {rep}"
 
 
 def test_gdn_state_bounded():

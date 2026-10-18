@@ -21,6 +21,9 @@
                     两条不同算法路径逐位一致（线性注意力决定性正确性质）
     G12 chunkwise 等价 Gated DeltaNet 递推 vs chunkwise 分块并行（块内并行 + 块间递推，
                     真实 GPU 内核训练形式）；含不被整除的尾块，块长扫描
+    G13 chunkwise 反向等价 Gated DeltaNet 物化全量状态反向 vs FlashAttention 式重计算反向
+                    （只存 O(T/C) 块入口状态）；两条不同资源/算法路径给同一解析梯度，
+                    再用中心差分（gradcheck）做完全独立裁判
 """
 
 from __future__ import annotations
@@ -133,7 +136,7 @@ def run_all_gates(seed: int = 0, steps: int = 60, verbose: bool = True) -> GateR
     reps = []
     from .l3_primitives import (Linear, RMSNorm, RoPE, SwiGLU, CausalAttention,
                                 CrossEntropy, rope_tables)
-    from .l4_deltanet import GatedDeltaNet, CausalConv1D, L2Norm
+    from .l4_deltanet import GatedDeltaNet, CausalConv1D, L2Norm, GatedDeltaNetChunkwise
     from .l5_moe import MoELayer, sigmoid as msig
     g2 = rng(spawn_seed(seed, "grad"))
     D = 8
@@ -157,6 +160,10 @@ def run_all_gates(seed: int = 0, steps: int = 60, verbose: bool = True) -> GateR
                           [g2.standard_normal((2, 2, 6, 4)), g2.standard_normal((2, 2, 6, 4)),
                            g2.standard_normal((2, 2, 6, 4)), msig(g2.standard_normal((2, 2, 6))),
                            msig(g2.standard_normal((2, 2, 6)))], seed=1, name="GatedDeltaNet")[0])
+    reps.append(gradcheck(GatedDeltaNetChunkwise(chunk=4),
+                          [g2.standard_normal((2, 2, 6, 4)), g2.standard_normal((2, 2, 6, 4)),
+                           g2.standard_normal((2, 2, 6, 4)), msig(g2.standard_normal((2, 2, 6))),
+                           msig(g2.standard_normal((2, 2, 6)))], seed=1, name="GatedDeltaNetChunkwise")[0])
     worst = max(r.max_abs_err for r in reps)
     npass = sum(r.passed for r in reps)
     add("梯度正确", npass == len(reps),
@@ -337,6 +344,34 @@ def run_all_gates(seed: int = 0, steps: int = 60, verbose: bool = True) -> GateR
         worst = max(worst, float(np.max(np.abs(rec12 - cw))))
     add("chunkwise 等价", worst < 1e-9,
         f"Gated DeltaNet 递推 vs chunkwise（T={Tg}, 6 种块长含不整除尾块）最大差 {worst:.2e}",
+        diff=worst)
+    R.results[-1].seconds = time.time() - t0
+
+    # ---------------------------------------------------------- G13 chunkwise 反向等价
+    # 物化全量状态的反向（materialized, 存 S_all 形状 B×H×(T+1)×D×D）vs FlashAttention 式
+    # 重计算反向（chunkwise, 只存 O(T/C) 块入口状态、块内即时重算、块间用伴随传输 G）：
+    # 两条不同的资源/算法路径必须给出逐位一致的解析梯度。这把「线性注意力内核反向」
+    # 这一最难的正确性性质机检到机器精度 —— 与 G11/G12 的前向三路径互证形成完整闭环。
+    t0 = time.time()
+    from .l4_deltanet import gdn_chunkwise_backward
+    gs = rng(spawn_seed(seed, "g13"))
+    Dg = 8
+    Tg = 23
+    qg = gs.standard_normal((2, 2, Tg, Dg))
+    kg = gs.standard_normal((2, 2, Tg, Dg))
+    vg = gs.standard_normal((2, 2, Tg, Dg))
+    bg = gs.random((2, 2, Tg))
+    ag = gs.random((2, 2, Tg))
+    gg = gs.standard_normal((2, 2, Tg, Dg))                 # 下游对 o 的梯度
+    ctx_g = _Ctx()
+    GatedDeltaNet().forward(ctx_g, qg, kg, vg, bg, ag)
+    dmat = GatedDeltaNet().backward(ctx_g, gg)              # 物化全量状态反向
+    worst = 0.0
+    for ch in (1, 2, 3,4, 8, 16):
+        dcw = gdn_chunkwise_backward(qg, kg, vg, bg, ag, gg, chunk=ch)
+        worst = max(worst, max(np.max(np.abs(a - b)) for a, b in zip(dmat, dcw)))
+    add("chunkwise 反向等价", worst < 1e-9,
+        f"Gated DeltaNet 物化反向 vs chunkwise 重计算反向（T={Tg}, 6 种块长）最大差 {worst:.2e}",
         diff=worst)
     R.results[-1].seconds = time.time() - t0
 
