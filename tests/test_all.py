@@ -348,6 +348,55 @@ def test_moe_no_token_dropped():
     assert np.all(np.isfinite(out)) and np.any(out != 0)
 
 
+def test_moe_gate_normalized_under_extreme_inputs():
+    """G17 回归：极端输入（大激活×大 router 权重×大 bias）下门控行和仍恒为 1。
+
+    曾抓出的真实缺陷：Z = Σ + 1e-12 的加法偏置在选中亲和度极小
+    （σ 低至 8.8e-27）时主导归一化，门控行和塌陷到 0（偏差 1.0）。
+    修复为无偏置归一化（Z=Σ，仅 Σ==0 时兜底）。
+    """
+    g = rng(91)
+    for scale in (0.01, 1.0, 100.0):
+        for rscale in (0.001, 1.0, 50.0):
+            E, dm, dff, N = 4, 6, 8, 16
+            x = g.standard_normal((N, dm)) * scale
+            router = g.standard_normal((E, dm)) * rscale
+            Wg = g.standard_normal((E, dff, dm)) * 0.3
+            Wu = g.standard_normal((E, dff, dm)) * 0.3
+            Wd = g.standard_normal((E, dm, dff)) * 0.3
+            bias = g.standard_normal(E) * 1000.0        # bias 主导选择
+            c = Ctx()
+            MoELayer(E, 2, False).forward(c, x, router, Wg, Wu, Wd, bias)
+            rs = c["g"].sum(axis=-1)
+            assert np.allclose(rs, 1.0, atol=1e-12), \
+                f"scale={scale} rscale={rscale} 行和偏差 {np.abs(rs - 1).max():.2e}"
+            assert np.array_equal(np.count_nonzero(c["mask"], axis=-1),
+                                  np.full(N, 2))
+
+
+def test_moe_expert_flops_equals_N_times_K():
+    """G17：专家计算总量恒 == N·K（FLOPs 比 K/E 的数值体现，无隐性稠密计算）。"""
+    g = rng(92)
+    N, E, K, dm, dff = 60, 8, 3, 5, 7
+    args = [g.standard_normal((N, dm)), g.standard_normal((E, dm)),
+            g.standard_normal((E, dff, dm)), g.standard_normal((E, dff, dm)),
+            g.standard_normal((E, dm, dff)), np.zeros(E), None, None, None]
+    c = Ctx()
+    MoELayer(E, K, False).forward(c, *args)
+    assert sum(len(t) for t in c["token_ids"]) == N * K
+
+
+def test_load_balancer_clip_and_empty_maxcv():
+    """G17：偏置 clip 边界 + maxcv 空历史必须显式为 inf（不假装均衡）。"""
+    lb = LoadBalancer(4, gamma=1e-2, bias_cap=0.2)
+    for _ in range(50):
+        lb.update(np.array([500.0, 0.0, 0.0, 0.0]))
+    assert np.all(np.abs(lb.bias) <= 0.2 + 1e-12)
+    lb.reset()
+    assert lb.bias.tolist() == [0.0] * 4 and lb.history == []
+    assert LoadBalancer(4).maxcv() == float("inf")
+
+
 # ============================================================ L6 优化器
 
 def test_muon2_quality_at_least_muon_90pct():

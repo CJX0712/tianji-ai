@@ -46,6 +46,14 @@
                     (e) SimPO 长度归一化 —— 序列复制两倍长平均 logprob 逐位不变；
                     (f) 参考模型冻结 —— loss_and_grads 前后 ref 参数零漂移，
                     freeze_copy 为独立数组（DPO 最隐蔽的失效模式）
+    G17 MoE 路由不变性 M2-M5 全部机检 + 对抗 fuzz（输入/router/bias 三轴极端，
+                    E/K 全扫描）：(a) 门控归一化行和==1 —— 曾由本门禁抓出
+                    「Σ+1e-12 加法偏置在极端输入下主导归一化 → 行和塌陷到 0」
+                    的真实缺陷（已修复为无偏置归一化）；(b) mask 行和恒==K、
+                    专家计算量==N·K（FLOPs 比 K/E）；(c) 单专家垄断场景全量
+                    覆盖无丢弃；(d) 偏置控制器：均衡零偏置、过载单调下降、
+                    clip 边界、maxcv 空历史=inf；(e) 均衡损失 f-detach 语义
+                    解析梯度 + 中心差分
 """
 
 from __future__ import annotations
@@ -643,6 +651,94 @@ def run_all_gates(seed: int = 0, steps: int = 60, verbose: bool = True) -> GateR
         f"/rejected{'↓' if dir_ok else '✗'}；ref 漂移 {drift16:.1e}；"
         f"SimPO 长度不变={simpo_ok}",
         analytic=worst16, e2e=e2e16, ref_drift=drift16)
+    R.results[-1].seconds = time.time() - t0
+
+    # ---------------------------------------------------------- G17 MoE 路由不变性
+    t0 = time.time()
+    from .l1_contract import Ctx as _Ctx17
+    from .l5_moe import MoELayer, LoadBalancer, sequence_balance_loss
+    g17 = rng(spawn_seed(seed, "moe"))
+
+    # ---- (a) M2 门控归一化 fuzz（对抗场景：输入/router/bias 三轴极端）
+    worst17 = 0.0
+    mask_ok = True
+    for _ in range(64):
+        N = int(g17.integers(1, 40)); E = int(g17.integers(2, 9))
+        K = int(g17.integers(1, E + 1)); d = int(g17.integers(2, 12))
+        dff = int(g17.integers(2, 8))
+        x = g17.standard_normal((N, d)) * float(g17.choice([0.01, 1.0, 100.0]))
+        router = g17.standard_normal((E, d)) * float(g17.choice([0.001, 1.0, 50.0]))
+        Wg = g17.standard_normal((E, dff, d)) * 0.3
+        Wu = g17.standard_normal((E, dff, d)) * 0.3
+        Wd = g17.standard_normal((E, d, dff)) * 0.3
+        bias = g17.standard_normal(E) * float(g17.choice([0.0, 1.0, 1000.0]))
+        c17 = _Ctx17()
+        MoELayer(E, K).forward(c17, x, router, Wg, Wu, Wd, bias)
+        worst17 = max(worst17, float(np.abs(np.sum(c17["g"], axis=-1) - 1.0).max()))
+        mask_ok = mask_ok and bool(np.all(c17["mask"].sum(axis=-1) == K))
+
+    # ---- (b) M4 稀疏性：专家计算总量 == N·K（FLOPs 比 K/E 的数值体现）
+    flops_ok = True
+    N17, E17, K17 = 50, 8, 2
+    for _ in range(8):
+        x = g17.standard_normal((N17, 6)); router = g17.standard_normal((E17, 6))
+        Wg = g17.standard_normal((E17, 4, 6)); Wu = g17.standard_normal((E17, 4, 6))
+        Wd = g17.standard_normal((E17, 6, 4))
+        c17 = _Ctx17()
+        MoELayer(E17, K17).forward(c17, x, router, Wg, Wu, Wd, None)
+        flops_ok = flops_ok and sum(len(t) for t in c17["token_ids"]) == N17 * K17
+
+    # ---- (c) M5 容量守恒：单专家垄断场景全量覆盖、无丢弃、无 NaN
+    xm = g17.standard_normal((30, 4)); Em = 4
+    routerm = np.zeros((Em, 4)); routerm[0] = 100.0
+    Wgm = g17.standard_normal((Em, 4, 4)); Wum = g17.standard_normal((Em, 4, 4))
+    Wdm = g17.standard_normal((Em, 4, 4))
+    c17 = _Ctx17()
+    MoELayer(Em, 2).forward(c17, xm, routerm, Wgm, Wum, Wdm, None)
+    cover_ok = (bool(np.all(c17["mask"].sum(axis=-1) == 2))
+                and bool(np.all(np.isfinite(c17["g"]))))
+
+    # ---- (d) M3 偏置控制器：均衡零偏置 / 过载单调下降 / clip / maxcv 语义
+    lb = LoadBalancer(4, gamma=1e-3, bias_cap=0.5)
+    for _ in range(10):
+        lb.update(np.full(4, 100.0))
+    eq_ok = bool(np.allclose(lb.bias, 0.0))
+    for _ in range(30):
+        lb.update(np.array([200.0, 50.0, 100.0, 100.0]))
+    bias_ok = (lb.bias[0] < 0 and lb.bias[1] > 0
+               and bool(np.all(np.abs(lb.bias) <= 0.5 + 1e-12)))
+    lb.reset()
+    cv_ok = lb.bias.tolist() == [0.0] * 4 and len(lb.history) == 0 \
+        and LoadBalancer(4).maxcv() == float("inf")
+
+    # ---- (e) 均衡损失 detach 语义：解析梯度 + 中心差分
+    N17b, E17b = 20, 4
+    aff = g17.standard_normal((N17b, E17b))
+    assign = np.zeros((N17b, E17b))
+    assign[np.arange(N17b), g17.integers(0, E17b, N17b)] = 1.0
+    _, grad17 = sequence_balance_loss(aff, assign)
+    f17 = assign.mean(axis=0)
+    grad_manual = np.broadcast_to(1e-4 * f17 * E17b / N17b, aff.shape)
+    eps17 = 1e-6
+    cv_worst = 0.0
+    for i in range(N17b):
+        for j in range(E17b):
+            o = aff[i, j]
+            aff[i, j] = o + eps17; lp, _ = sequence_balance_loss(aff, assign)
+            aff[i, j] = o - eps17; lm, _ = sequence_balance_loss(aff, assign)
+            aff[i, j] = o
+            cv_worst = max(cv_worst, abs((lp - lm) / (2 * eps17) - grad17[i, j]))
+
+    ok17 = (worst17 < 1e-12 and mask_ok and flops_ok and cover_ok
+            and eq_ok and bias_ok and cv_ok
+            and np.allclose(grad17, grad_manual) and cv_worst < 1e-6)
+    add("MoE 路由不变性", ok17,
+        f"M2 门控归一化 64 组对抗 fuzz 行和最大偏差 {worst17:.2e}（曾被抓出 "
+        f"1.0e+00 归一化塌陷并修复）；M4 mask 行和恒==K={mask_ok}、专家计算量"
+        f"==N·K={flops_ok}；M5 垄断场景全量覆盖={cover_ok}；M3 偏置控制器"
+        f"（均衡零偏置={eq_ok}/过载下降={bias_ok}/clip 与 maxcv=inf={cv_ok}）；"
+        f"均衡损失 detach 梯度中心差分 {cv_worst:.2e}",
+        gate_worst=worst17, flops=flops_ok, balance=bias_ok, cv=cv_worst)
     R.results[-1].seconds = time.time() - t0
 
     return R

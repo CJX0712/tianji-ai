@@ -160,12 +160,22 @@ class MoELayer(Module):
         E, K = self.E, self.K
 
         logits = x @ router.T                    # (N, E)
+        # 数值下界保护：clip 到 [-60, 60]（与 silu 同惯例）。不加此保护时，
+        # 极端输入（大激活 × 大 router 权重）可使选中专家的 sigmoid 全部
+        # 下溢为 0，归一化 Z→1e-12 而 gated 全零 → 该 token 门控行和=0
+        # （M2 失效），路由专家输出整体丢失。clip 后 σ(±60)∈[8.8e-27, 1-8.8e-27]，
+        # 任意 E 个专家之和恒远大于 Z 的 1e-12 保护阈值，归一化永不塌陷。
+        logits = np.clip(logits, -60.0, 60.0)
         s = sigmoid(logits)                      # 亲和度（参与门控值）
         _, sel = topk(s + bias, K, axis=-1)      # 偏置只参与选择
         mask = np.zeros((N, E), dtype=np.float64)
         np.put_along_axis(mask, sel, 1.0, axis=-1)
         gated = s * mask
-        Z = np.sum(gated, axis=-1, keepdims=True) + 1e-12
+        # 归一化必须无加法偏置：Z = Σ + ε 会在选中亲和度极小（极端输入下
+        # σ 低至 8.8e-27）时被 ε 主导，门控行和偏离 1（M2 失效）。
+        # 正确写法：Σ>0 时严格归一（行和恒 1）；Σ==0 时兜底防除零（g=0）。
+        Z = np.sum(gated, axis=-1, keepdims=True)
+        Z = np.where(Z > 0.0, Z, 1.0)
         g = gated / Z                            # (N, E)，行和恒为 1（不变量 M2）
 
         # ---- 按专家分组计算（稀疏：每个 token 只走 K 个专家）

@@ -9,7 +9,7 @@ on:
 
 jobs:
   verify:
-    name: TIANJI · 48 tests + 16 gates
+    name: TIANJI · 51 tests + 17 gates
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -21,10 +21,10 @@ jobs:
       - name: Install locked dependencies
         run: pip install -r requirements.lock.txt
 
-      - name: Unit tests (48)
+      - name: Unit tests (51)
         run: make test
 
-      - name: Delivery gates (16)
+      - name: Delivery gates (17)
         run: make gates
 
       - name: Quickstart smoke
