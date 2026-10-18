@@ -12,7 +12,7 @@
     L7  训练          调度 / 数据管道 / 梯度累积 / 度量
     L8  推理          KV cache / 量化 / 投机解码
     L9  对齐          DPO / IPO / SimPO / KTO
-    L10 微指令+门禁   1024 条可执行微指令 + 18 道交付门禁
+    L10 微指令+门禁   1024 条可执行微指令 + 19 道交付门禁
 
 快速开始：
     >>> from tianji import TianjiConfig, TianjiModel, init_params

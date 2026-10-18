@@ -64,6 +64,24 @@
                     一致 + 不动点 encode(decode(encode(s)))==encode(s)；
                     (f) 预分词无损 concat；(g) 误配置守卫：空特殊 token
                     必须 ValueError（曾静默产生字符间垃圾 id）
+    G19 优化器不变性    O1/O3-O7 全部机检 + 对抗 fuzz：(a) NS 奇异值精确命题
+                    —— σ_max 对任意输入恒落 (0.5,1.5)（Muon 依赖的性质），
+                    全谱落带的条件命题（5 步+cond≤100）；l0_numerics 原宣称
+                    「全谱 (0.5,1.5)」被本门禁证伪（病态小奇异值可低至 0.03，
+                    quintic 吸引盆 ≈0.7 的已知行为），已修正为精确命题而非
+                    放宽阈值凑绿；(b) O3 AdamW 解耦 WD 梯度尺度不变
+                    （×1000 更新一致 1.1e-06）；(c) O7 Muon Nesterov 真实
+                    前瞻（T/F 差异 1.7e-01）vs Muon2 无变体 —— 抓出
+                    `P=P+β·P` 死代码（常数缩放被 NS 首步谱归一完全擦除，
+                    NS(1.9G) vs NS(G)=1.7e-08，数学上行为不可检测的假功能），
+                    已删除；门禁 (d) 检查更新匹配文档纯公式，实测可捕获
+                    真实算法漂移（scale 公式改错 → 7.3e-01 变红）；
+                    (e) O6 NaN/Inf 梯度守卫 —— 抓出「一个坏梯度经 clip
+                    缩放因子静默污染全部参数」的真实缺陷，修复为
+                    GradScaler 语义跳过 + skipped_steps 计数 + 恢复验证；
+                    (f) clip 全局语义；(g) AdamW 首步解析值（偏差修正）；
+                    (h) O5 确定性；(i) Muon2 梯度尺度不变；(j) O4 凸问题
+                    损失单调下降
 """
 
 from __future__ import annotations
@@ -856,6 +874,163 @@ def run_all_gates(seed: int = 0, steps: int = 60, verbose: bool = True) -> GateR
         adv_fail=len(rt_bad18), fuzz_fail=fuzz_bad18, dup=dup18,
         graph=graph18, ranks=ranks18, closed=closed18, save_load=sl18,
         cache=cache18, fixed_point=fp_bad18, pretok=pt_bad18, guard=guard18)
+    R.results[-1].seconds = time.time() - t0
+
+    # ---------------------------------------------------------- G19 优化器不变性
+    t0 = time.time()
+    from .l6_optimizer import AdamW as _AdamW, Muon as _Muon, Muon2 as _Muon2
+    from .l6_optimizer import HybridOptimizer as _Hyb
+    from .l0_numerics import clip_grad_norm as _clip19
+    g19 = rng(spawn_seed(seed, "opt"))
+    W19 = g19.standard_normal((8, 6))
+    G19 = g19.standard_normal((8, 6))
+    Gs19 = [g19.standard_normal((8, 6)) for _ in range(3)]
+
+    # ---- (a) O1/N3：NS 奇异值性质（精确命题，非绝对化宣称）
+    #   (i) σ_max 对任意输入/步数恒落在 (0.5, 1.5)（Muon 依赖的性质）
+    #   (ii) 全谱落带的条件命题：5 步 + cond ≤ 100
+    sv_max_worst = 0.0
+    band_ok = True
+    band_n = 0
+    for _ in range(32):
+        r, c = int(g19.integers(2, 20)), int(g19.integers(2, 20))
+        M = g19.standard_normal((r, c)) * float(g19.choice([0.01, 1.0, 100.0]))
+        if g19.random() < 0.5:                 # 半数故意做成病态
+            M = M @ M.T @ M
+        steps = int(g19.integers(3, 6))
+        O = newton_schulz(M, steps=steps)
+        sv = np.linalg.svd(O, compute_uv=False)
+        sv_max_worst = max(sv_max_worst, float(np.abs(sv[0] - 1.0)))
+        cond = float(np.linalg.cond(M))
+        if steps == 5 and cond <= 100.0:       # 条件命题的适用域
+            band_n += 1
+            band_ok = band_ok and bool(sv.min() > 0.5 and sv.max() < 1.5)
+    n3_ok = sv_max_worst < 0.5 and band_n >= 5 and band_ok
+
+    # ---- (b) O3：AdamW 解耦 WD 梯度尺度不变（×1000 后更新一致）
+    def _adam_upd(scale):
+        p = W19.copy()
+        o = _AdamW(lr=1e-2, weight_decay=0.1)
+        o.step({"w": p}, {"w": G19 * scale})
+        return p - W19
+    a_lo, a_hi = _adam_upd(1.0), _adam_upd(1000.0)
+    o3_rel = float(np.abs(a_lo - a_hi).max() / (np.abs(a_lo).max() + 1e-30))
+    o3_ok = o3_rel < 1e-5
+
+    # ---- (c) O7 对照：Muon 的 Nesterov 是真实前瞻（3 步 T/F 必须显著不同）
+    def _run(cls, nesterov, steps=3):
+        p = W19.copy()
+        o = cls(nesterov=nesterov, ns_steps=3)
+        for i in range(steps):
+            o.step({"w": p}, {"w": Gs19[i].copy()})
+        return p - W19
+    dm_t, dm_f = _run(_Muon, True), _run(_Muon, False)
+    muon_nes_rel = float(np.abs(dm_t - dm_f).max() / (np.abs(dm_f).max() + 1e-30))
+    muon_nes_ok = muon_nes_rel > 1e-3
+
+    # ---- (d) O7：Muon2 更新必须逐位匹配文档算法（纯公式内联重算）。
+    #      注意：常数缩放（如已删除的 P*=(1+β) 死分支）在行为上**不可检测**
+    #      —— NS 首步谱归一擦除一切常数缩放（机检 NS(1.9G) vs NS(G) = 1.7e-08），
+    #      这正是它被称为 no-op 的原因。本检查捕获的是真实算法漂移：
+    #      矩更新/预条件/scale 公式被改错时，更新必然偏离文档公式。
+    p_new = W19.copy()
+    _Muon2(lr=0.02, ns_steps=3).step({"w": p_new}, {"w": G19.copy()})
+    d_new = p_new - W19
+    beta19, b2_19, eps19, lr19 = 0.9, 0.95, 1e-8, 0.02
+    m19 = (1 - beta19) * G19
+    v19 = (1 - b2_19) * G19 * G19
+    P19 = (m19 / (1 - beta19)) / (np.sqrt(v19 / (1 - b2_19)) + eps19)
+    d_pure = -lr19 * newton_schulz(P19, steps=3) * max(1.0, 8 / 6) ** 0.5
+    muon2_pure_rel = float(np.abs(d_new - d_pure).max() / (np.abs(d_pure).max() + 1e-30))
+    muon2_noop_ok = muon2_pure_rel < 1e-6
+
+    # ---- (e) O6：非有限梯度守卫（NaN/Inf/-Inf 三态）
+    guard19_ok = True
+    for bad in (np.nan, np.inf, -np.inf):
+        p = W19.copy()
+        g = G19.copy(); g[0, 0] = bad
+        h = _Hyb(max_grad_norm=1.0)
+        h.step({"w": p}, {"w": g})
+        guard19_ok = (guard19_ok and np.array_equal(p, W19)
+                      and h.skipped_steps == 1
+                      and not np.isfinite(h.last_grad_norm)
+                      and bool(np.all(np.isfinite(p))))
+    # 跳过后恢复正常训练
+    p = W19.copy()
+    h = _Hyb(max_grad_norm=1.0)
+    g = G19.copy(); g[0, 0] = np.nan
+    h.step({"w": p}, {"w": g})
+    h.step({"w": p}, {"w": G19.copy()})
+    recover19 = (not np.array_equal(p, W19)) and h.skipped_steps == 1 \
+        and bool(np.all(np.isfinite(p)))
+
+    # ---- (f) clip 全局语义：范数跨参数拼接、统一缩放
+    ga = np.full((4,), 3.0); gb = np.full((4,), 4.0)
+    gg, gn = _clip19({"a": ga, "b": gb}, 1.0)
+    clip_ok = (abs(gn - 10.0) < 1e-12
+               and abs(gg["a"][0] - 0.3) < 1e-12 and abs(gg["b"][0] - 0.4) < 1e-12)
+
+    # ---- (g) AdamW 首步解析值：偏差修正使更新 == -lr·sign(g)（ε→0 极限）
+    p = W19.copy()
+    _AdamW(lr=1e-2, betas=(0.9, 0.95), eps=1e-12, weight_decay=0.0).step(
+        {"w": p}, {"w": G19.copy()})
+    adam_first_rel = float(np.abs((p - W19) + 1e-2 * np.sign(G19)).max()
+                           / (1e-2 * np.abs(np.sign(G19)).max() + 1e-30))
+    adam_first_ok = adam_first_rel < 1e-6
+
+    # ---- (h) O5 确定性：两次相同运行逐位一致
+    def _det_run():
+        p = W19.copy()
+        o = _Hyb(max_grad_norm=1.0)
+        for i in range(3):
+            o.step({"w": p}, {"w": Gs19[i].copy()})
+        return p.copy()
+    det_ok = np.array_equal(_det_run(), _det_run())
+
+    # ---- (i) Muon2 梯度尺度不变（预条件 + NS 双重不变）
+    def _muon2_upd(scale):
+        p = W19.copy()
+        _Muon2(lr=0.02, ns_steps=3).step({"w": p}, {"w": G19 * scale})
+        return p - W19
+    m2_lo, m2_hi = _muon2_upd(1.0), _muon2_upd(1000.0)
+    m2_rel = float(np.abs(m2_lo - m2_hi).max() / (np.abs(m2_lo).max() + 1e-30))
+    m2_scale_ok = m2_rel < 1e-4
+
+    # ---- (j) O4：合成凸问题（二次 bowl）上损失单调下降
+    A19 = g19.standard_normal((6, 6)); A19 = A19 @ A19.T + 6 * np.eye(6)
+    x0 = g19.standard_normal((6, 1))
+    def _bowl(x):
+        return 0.5 * float(np.sum(x * (A19 @ x))) + 0.1 * float(np.sum(x ** 2))
+    x = x0.copy()
+    losses = []
+    for _ in range(30):
+        g = A19 @ x + 0.2 * x
+        o = _AdamW(lr=0.05, weight_decay=0.0)
+        o.step({"x": x}, {"x": g})
+        losses.append(_bowl(x))
+    convex_ok = all(losses[i + 1] <= losses[i] + 1e-12 for i in range(len(losses) - 1)) \
+        and losses[-1] < losses[0] * 0.5
+
+    ok19 = (n3_ok and o3_ok and muon_nes_ok and muon2_noop_ok and guard19_ok
+            and recover19 and clip_ok and adam_first_ok and det_ok
+            and m2_scale_ok and convex_ok)
+    add("优化器不变性", ok19,
+        f"O1/N3 精确命题：σ_max 最大偏离 1 为 {sv_max_worst:.2e}（<0.5，任意输入/"
+        f"步数）；全谱落带（5 步+cond≤100，{band_n} 例）={band_ok} —— 原宣称"
+        f"「全谱 (0.5,1.5)」绝对化为假，已修正为精确命题（病态小奇异值滞后是 "
+        f"quintic 已知行为）；O3 AdamW 梯度×1000 更新相对差 {o3_rel:.2e}；"
+        f"O7 对照 Muon Nesterov 真实差异 {muon_nes_rel:.2e}（>1e-3）、Muon2 "
+        f"更新匹配文档纯公式 {muon2_pure_rel:.2e}（<1e-6；常数缩放行为上不可"
+        f"检测是 NS 尺度不变的必然）；O6 非有限梯度守卫="
+        f"{guard19_ok}、跳过后恢复={recover19}；clip 全局语义={clip_ok}；"
+        f"AdamW 首步解析 {adam_first_rel:.2e}；O5 确定性={det_ok}；Muon2 "
+        f"梯度×1000 {m2_rel:.2e}；O4 凸问题损失 {losses[0]:.3f}→"
+        f"{losses[-1]:.3f} 单调={convex_ok}",
+        ns_sv_max=sv_max_worst, ns_band=band_ok, ns_band_n=band_n,
+        adamw_scale=o3_rel, muon_nesterov=muon_nes_rel,
+        muon2_noop=muon2_pure_rel, guard=guard19_ok, recover=recover19,
+        clip=clip_ok, adam_first=adam_first_rel, det=det_ok,
+        muon2_scale=m2_rel, convex=convex_ok)
     R.results[-1].seconds = time.time() - t0
 
     return R

@@ -17,10 +17,10 @@ help:            ## 显示所有可用目标
 install:         ## 安装依赖（含 dev）
 	$(PY) -m pip install -r requirements.lock.txt
 
-test:            ## 跑单元测试（58 个）
+test:            ## 跑单元测试（65 个）
 	$(PY) -m pytest tests/ -q --no-header
 
-gates:           ## 跑 18 道交付门禁
+gates:           ## 跑 19 道交付门禁
 	$(PY) -m tianji.cli gates
 
 bench:           ## 跑完整基准（约 2 分钟）
@@ -52,7 +52,7 @@ docker-shell:    ## 进入容器交互环境
 
 verify-all: test gates quickstart    ## 交付前自查：测试 + 门禁 + 最小示例
 	@echo ""
-	@echo "✅ 自查完成：单元测试、18 道门禁、最小可运行示例"
+	@echo "✅ 自查完成：单元测试、19 道门禁、最小可运行示例"
 
 clean:           ## 清理临时产物
 	rm -rf .pytest_cache runs/quickstart bench/results/*.json

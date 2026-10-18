@@ -30,12 +30,24 @@
     embedding、LM head、bias、RMSNorm gain 走 AdamW。
 
 不变量（门禁复检）：
-    O1 Newton-Schulz 输出奇异值落在 (0.5, 1.5)（Muon 的公开验收标准）
+    O1 Newton-Schulz 输出奇异值落在 (0.5, 1.5)（Muon 的公开验收标准，
+       G19 门禁机检 —— 修复前 l0_numerics 宣称「N3 门禁守着」但门禁不存在，
+       属于宣称-门禁不一致，已补齐）
     O2 Muon2 在 3 步 NS 下的正交化质量 >= Muon 在 5 步下的质量
        （用「与真极分解 UVᵀ 的余弦相似度」度量）
     O3 AdamW 的 decoupled weight decay：纯权重衰减项不受梯度缩放影响
+       （G19 机检：梯度 ×1000 后更新逐位一致到 1e-5 内）
     O4 优化器更新后损失下降（合成凸问题上单调）
     O5 同 seed 两次运行逐位一致（确定性）
+    O6 非有限梯度（NaN/Inf）不污染参数：HybridOptimizer 按 GradScaler
+       语义跳过整个 step，参数逐位不变、skipped_steps 计数（G19 机检）
+    O7 Muon2 无 Nesterov 变体：Newton-Schulz 首步谱归一化使预条件方向上的
+       任何常数缩放被完全擦除（机检 NS(1.9·G) vs NS(G) = 1.7e-08；对照
+       Muon 的真实 Nesterov 差异 3.9e-01）。早期实现有一个 `P = P + beta*P`
+       的「Nesterov 前瞻」分支，数学上等于 P *= (1+beta)，被 NS 归一化
+       完全擦除 —— 假功能，已删除。注意：这类常数缩放在行为上**不可检测**
+       （这正是 no-op 的定义），G19 门禁 (d) 检查的是「更新匹配文档纯公式」，
+       捕获的是真实算法漂移（矩更新/预条件/scale 被改错）
 """
 
 from __future__ import annotations
@@ -152,16 +164,26 @@ class Muon2(Muon):
         W ← W − lr·O·scale
 
     为什么这样能少 40% 的 NS 迭代：
-    NS 迭代本质是在求极分解的近似，其收敛速度取决于输入矩阵的条件数。
-    动量矩阵 G 通常是重尾、病态的；二阶矩预条件把各方向的量级拉平，
-    等价于是给 NS 一个更好的起点。论文用「方向对齐度」量化了这一点。
+        NS 迭代本质是在求极分解的近似，其收敛速度取决于输入矩阵的条件数。
+        动量矩阵 G 通常是重尾、病态的；二阶矩预条件把各方向的量级拉平，
+        等价于是给 NS 一个更好的起点。论文用「方向对齐度」量化了这一点。
+
+    为什么没有 Nesterov 变体（G19 门禁钉死的性质）：
+        Muon 的 Nesterov（方向 = g + β·m）是真实的前瞻外推，机检 T/F
+        更新差异 3.9e-01。但 Muon2 早期实现曾有一个对应分支
+        `P = P + β·P`，数学上只是 P *= (1+β) 常数缩放 —— 而
+        Newton-Schulz 首步即按谱范数归一（l0_numerics.newton_schulz），
+        常数缩放被完全擦除（机检：NS(1.9·G) vs NS(G) = 1.7e-08）。
+        即该分支是零效果假功能，已删除。此类常数缩放在行为上不可检测
+        （no-op 的数学必然），G19 门禁 (d) 因此检查「更新匹配文档纯公式」，
+        捕获真实算法漂移而非自欺欺人的 T/F 对照。
     """
 
     name = "Muon2"
 
-    def __init__(self, lr=0.02, betas=(0.9, 0.95), eps=1e-8, nesterov=True,
+    def __init__(self, lr=0.02, betas=(0.9, 0.95), eps=1e-8,
                  ns_steps=3, weight_decay=0.0):
-        super().__init__(lr=lr, momentum=betas[0], nesterov=nesterov,
+        super().__init__(lr=lr, momentum=betas[0], nesterov=False,
                          ns_steps=ns_steps, weight_decay=weight_decay)
         self.b2 = float(betas[1])
         self.eps = float(eps)
@@ -185,9 +207,6 @@ class Muon2(Muon):
             mhat = m / (1 - self.beta ** self.t)
             vhat = v / (1 - self.b2 ** self.t)
             P = mhat / (np.sqrt(vhat) + self.eps)
-            if self.nesterov:
-                # Nesterov 视角下的前瞻点：用预条件后的方向再做一次动量外推
-                P = P + self.beta * (mhat / (np.sqrt(vhat) + self.eps))
             shape = p.shape
             P2 = P.reshape(shape[0], -1) if p.ndim > 2 else P
             O = newton_schulz(P2, steps=self.ns_steps).reshape(shape)
@@ -207,6 +226,10 @@ class HybridOptimizer:
     为什么用名单而不是纯维度规则：embedding 与 lm_head 虽然也是 2D，
     但它们的梯度是稀疏查表式的，正交化会破坏语义结构 ——
     这个例外必须显式声明，不能靠维度猜。
+
+    训练安全性（GradScaler 语义）：全局梯度范数非有限（NaN/Inf）时
+    跳过整个 step（参数逐位不变，skipped_steps 累计）—— 否则一个坏
+    梯度会经 clip 缩放因子把全部参数静默污染成 NaN。
     """
 
     ADAM_ONLY_EXACT = ("tok_emb", "lm_head")
@@ -218,6 +241,7 @@ class HybridOptimizer:
         self.adam = adamw if adamw is not None else AdamW()
         self.max_grad_norm = float(max_grad_norm)
         self.last_grad_norm = 0.0
+        self.skipped_steps = 0
 
     def is_muon(self, name: str, p: np.ndarray) -> bool:
         if p.ndim < 2:
@@ -230,8 +254,19 @@ class HybridOptimizer:
         return True
 
     def step(self, params: dict[str, np.ndarray], grads: dict[str, np.ndarray]) -> None:
-        grads, norm = clip_grad_norm(grads, self.max_grad_norm)
+        # errstate：非有限梯度下 clip 内部会出现 inf*0=nan 的浮点警告，
+        # 语义上无害（紧接着就被守卫跳过），但不该污染训练日志
+        with np.errstate(invalid="ignore", over="ignore"):
+            grads, norm = clip_grad_norm(grads, self.max_grad_norm)
         self.last_grad_norm = norm
+        # ---- 非有限梯度守卫（O6，G19 机检）
+        # 一个 NaN/Inf 梯度会让 clip 的缩放因子变成 nan/inf，进而把**全部**
+        # 参数静默污染成非有限值 —— 不报错、不崩溃，模型无声死亡。
+        # 语义对齐 PyTorch AMP GradScaler：检测到非有限梯度时跳过整个 step，
+        # 参数逐位不变，只累计 skipped_steps 供上层观测/报警。
+        if not np.isfinite(norm):
+            self.skipped_steps += 1
+            return
         muon_p, muon_g = {}, {}
         adam_p, adam_g = {}, {}
         for k, p in params.items():

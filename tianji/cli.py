@@ -1,6 +1,6 @@
 """命令行入口 —— 让交付物可以「直接跑」，而不只是「可以读」。
 
-    python -m tianji.cli gates          跑 18 道交付门禁
+    python -m tianji.cli gates          跑 19 道交付门禁
     python -m tianji.cli test           跑梯度检验冒烟
     python -m tianji.cli bench          跑完整基准
     python -m tianji.cli microops       微指令统计
@@ -158,7 +158,7 @@ def main(argv=None):
     ap.add_argument("--steps", type=int, default=None)
     sub = ap.add_subparsers(dest="cmd", required=True)
 
-    p_g = sub.add_parser("gates", help="跑 18 道交付门禁")
+    p_g = sub.add_parser("gates", help="跑 19 道交付门禁")
     p_g.add_argument("--steps", type=int, default=None)
     p_g.add_argument("--seed", type=int, default=None)
     sub.add_parser("test", help="模块梯度检验冒烟")

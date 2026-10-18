@@ -11,7 +11,8 @@ import pytest
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from tianji.l0_numerics import (        # noqa: E402
-    logsumexp, softmax, newton_schulz, spectral_norm, spawn_seed, rng)
+    logsumexp, softmax, newton_schulz, spectral_norm, spawn_seed, rng,
+    clip_grad_norm)
 from tianji.l1_contract import gradcheck, Ctx, Module       # noqa: E402
 from tianji.l2_tokenizer import BPE, pretokenize            # noqa: E402
 from tianji.l3_primitives import (                          # noqa: E402
@@ -22,7 +23,8 @@ from tianji.l4_deltanet import (        # noqa: E402
     gdn_chunkwise_backward, GatedDeltaNetChunkwise)
 from tianji.l5_moe import (                                 # noqa: E402
     MoELayer, LoadBalancer, sigmoid)
-from tianji.l6_optimizer import Muon, Muon2, orthogonalization_quality  # noqa: E402
+from tianji.l6_optimizer import (Muon, Muon2, AdamW, HybridOptimizer,  # noqa: E402
+                              orthogonalization_quality)
 from tianji.l7_train import cosine_schedule, wsd_schedule, DataLoader   # noqa: E402
 from tianji.l8_infer import (                               # noqa: E402
     quantize_per_channel, quantize_groupwise, dequantize, speculative_decode)
@@ -501,6 +503,140 @@ def test_muon2_quality_at_least_muon_90pct():
     q3 = orthogonalization_quality(G, newton_schulz(G / (np.sqrt(np.mean(G ** 2)) + 1e-8),
                                                     steps=3))
     assert q3 >= 0.9 * q5
+
+
+def test_optimizer_skips_nonfinite_grads():
+    """O6：NaN/Inf 梯度不污染参数（GradScaler 语义，G19 机检）。
+
+    修复前缺陷：一个 NaN 梯度经 clip 缩放因子把**全部**参数静默污染。
+    """
+    g = rng(4)
+    W = g.standard_normal((8, 6))
+    G = g.standard_normal((8, 6))
+    for bad in (np.nan, np.inf, -np.inf):
+        p = W.copy()
+        gg = G.copy(); gg[0, 0] = bad
+        h = HybridOptimizer(max_grad_norm=1.0)
+        h.step({"w": p}, {"w": gg})
+        assert np.array_equal(p, W), f"{bad} 梯度污染了参数"
+        assert h.skipped_steps == 1
+        assert not np.isfinite(h.last_grad_norm)
+        assert np.all(np.isfinite(p))
+    # 跳过后恢复正常训练
+    p = W.copy()
+    h = HybridOptimizer(max_grad_norm=1.0)
+    gg = G.copy(); gg[0, 0] = np.nan
+    h.step({"w": p}, {"w": gg})
+    h.step({"w": p}, {"w": G.copy()})
+    assert not np.array_equal(p, W) and h.skipped_steps == 1
+    assert np.all(np.isfinite(p))
+
+
+def test_adamw_decoupled_wd_gradient_scale_invariant():
+    """O3：解耦权重衰减不受梯度缩放影响（×1000 后更新一致到 1e-5）。"""
+    g = rng(6)
+    W = g.standard_normal((8, 6))
+    G = g.standard_normal((8, 6))
+    outs = []
+    for scale in (1.0, 1000.0):
+        p = W.copy()
+        AdamW(lr=1e-2, weight_decay=0.1).step({"w": p}, {"w": G * scale})
+        outs.append(p - W)
+    rel = np.abs(outs[0] - outs[1]).max() / (np.abs(outs[0]).max() + 1e-30)
+    assert rel < 1e-5, f"梯度缩放改变了更新量：rel={rel:.2e}"
+
+
+def test_muon_nesterov_is_real_but_muon2_has_no_variant():
+    """O7：Muon 的 Nesterov 是真实前瞻；Muon2 无 Nesterov 变体。
+
+    Muon2 早期实现的 `P = P + beta*P` 分支数学上只是常数缩放，被 NS
+    首步谱归一完全擦除（机检 1.7e-08）——假功能，已删除。此处钉死：
+    Muon T/F 3 步更新必须显著不同（真实），且 Muon2 更新必须匹配文档
+    纯公式（无隐藏缩放）。
+    """
+    g = rng(8)
+    W = g.standard_normal((8, 6))
+    Gs = [g.standard_normal((8, 6)) for _ in range(3)]
+
+    def run(cls, nesterov, steps=3):
+        p = W.copy()
+        o = cls(nesterov=nesterov, ns_steps=3)
+        for i in range(steps):
+            o.step({"w": p}, {"w": Gs[i].copy()})
+        return p - W
+
+    dm_t, dm_f = run(Muon, True), run(Muon, False)
+    rel = np.abs(dm_t - dm_f).max() / (np.abs(dm_f).max() + 1e-30)
+    assert rel > 1e-3, f"Muon Nesterov 应当是真实前瞻，实测差异 {rel:.2e}"
+
+    # Muon2 更新 == 文档纯公式（无死分支、无隐藏缩放）
+    p = W.copy()
+    Muon2(lr=0.02, ns_steps=3).step({"w": p}, {"w": Gs[0].copy()})
+    beta, b2, eps, lr = 0.9, 0.95, 1e-8, 0.02
+    G = Gs[0]
+    m = (1 - beta) * G
+    v = (1 - b2) * G * G
+    P = (m / (1 - beta)) / (np.sqrt(v / (1 - b2)) + eps)
+    pure = -lr * newton_schulz(P, steps=3) * max(1.0, 8 / 6) ** 0.5
+    rel2 = np.abs((p - W) - pure).max() / (np.abs(pure).max() + 1e-30)
+    assert rel2 < 1e-6, f"Muon2 更新偏离文档纯公式：{rel2:.2e}"
+
+
+def test_newton_schulz_spectral_properties():
+    """N3 精确命题：σ_max 恒落 (0.5,1.5)；5 步+cond≤100 全谱落带。"""
+    g = rng(12)
+    band_n = 0
+    for _ in range(24):
+        r, c = int(g.integers(2, 16)), int(g.integers(2, 16))
+        M = g.standard_normal((r, c)) * float(g.choice([0.01, 1.0, 100.0]))
+        if g.random() < 0.5:
+            M = M @ M.T @ M
+        steps = int(g.integers(3, 6))
+        O = newton_schulz(M, steps=steps)
+        sv = np.linalg.svd(O, compute_uv=False)
+        assert 0.5 < sv[0] < 1.5, f"σ_max={sv[0]:.3f} 跑出 (0.5,1.5)"
+        if steps == 5 and np.linalg.cond(M) <= 100.0:
+            band_n += 1
+            assert sv.min() > 0.5 and sv.max() < 1.5, \
+                f"5 步+cond≤100 全谱未落带：sv=[{sv.min():.3f},{sv.max():.3f}]"
+    assert band_n >= 3
+
+
+def test_adamw_first_step_matches_sign_update():
+    """AdamW 偏差修正：首步更新 == -lr·sign(g)（ε→0 极限，解析值）。"""
+    g = rng(15)
+    W = g.standard_normal((6, 5))
+    G = g.standard_normal((6, 5))
+    p = W.copy()
+    AdamW(lr=1e-2, betas=(0.9, 0.95), eps=1e-12, weight_decay=0.0).step(
+        {"w": p}, {"w": G.copy()})
+    rel = np.abs((p - W) + 1e-2 * np.sign(G)).max() / 1e-2
+    assert rel < 1e-6, f"首步偏离 -lr*sign(g)：rel={rel:.2e}"
+
+
+def test_clip_grad_norm_global_semantics():
+    """全局范数跨参数拼接、统一缩放。"""
+    gg, norm = clip_grad_norm({"a": np.full((4,), 3.0), "b": np.full((4,), 4.0)}, 1.0)
+    assert abs(norm - 10.0) < 1e-12
+    assert abs(gg["a"][0] - 0.3) < 1e-12 and abs(gg["b"][0] - 0.4) < 1e-12
+
+
+def test_optimizer_convex_monotone():
+    """O4：合成凸问题（二次 bowl）上 AdamW 损失单调下降。"""
+    g = rng(17)
+    A = g.standard_normal((6, 6)); A = A @ A.T + 6 * np.eye(6)
+    x = g.standard_normal((6, 1))
+
+    def bowl(v):
+        return 0.5 * float(np.sum(v * (A @ v))) + 0.1 * float(np.sum(v ** 2))
+
+    losses = []
+    for _ in range(30):
+        grad = A @ x + 0.2 * x
+        AdamW(lr=0.05, weight_decay=0.0).step({"x": x}, {"x": grad})
+        losses.append(bowl(x))
+    assert all(losses[i + 1] <= losses[i] + 1e-12 for i in range(len(losses) - 1))
+    assert losses[-1] < losses[0] * 0.5
 
 
 def test_muon_handles_3d_params():
