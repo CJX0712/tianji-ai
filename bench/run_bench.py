@@ -37,7 +37,8 @@ from tianji.l0_numerics import spawn_seed, rng                            # noqa
 from tianji.l6_optimizer import HybridOptimizer, AdamW, Muon, Muon2       # noqa: E402
 from tianji.l7_train import DataLoader, Trainer, evaluate                 # noqa: E402
 from tianji.l8_infer import (quantize_per_channel, quantize_groupwise,    # noqa: E402
-                             dequantize, speculative_decode, generate)
+                             dequantize, speculative_decode, generate,
+                             TinyDraftGDN)
 
 
 def synth_tokens(n: int, vocab: int, seed: int = 0) -> np.ndarray:
@@ -215,10 +216,19 @@ def bench_speculative(seed, max_new=16):
     Trainer(m, opt, ld, total_steps=25, warmup=5, lr_max=0.03).run(25, verbose=False)
     prompt = synth_tokens(6, cfg.vocab_size, seed + 3)
     ids, st = speculative_decode(m, prompt, max_new=max_new, gamma=1, seed=seed)
-    print(f"  投机解码: drafted={st.drafted} accepted={st.accepted} "
-          f"接受率={st.accept_rate:.3f} 平均产出/步={st.speedup:.3f}", flush=True)
+    print(f"  MTP 搭车(γ=1): drafted={st.drafted} accepted={st.accepted} "
+          f"接受率={st.accept_rate:.3f} tokens/forward={st.speedup:.3f}", flush=True)
+    # 独立轻量 draft + γ=3 一次 batch 并行验证：每轮 1 次主干 forward
+    dm = TinyDraftGDN(cfg.vocab_size, d=32, seed=seed)
+    ids2, st2 = speculative_decode(m, prompt, max_new=max_new, gamma=3,
+                                   seed=seed, draft_model=dm)
+    print(f"  独立draft(γ=3): drafted={st2.drafted} accepted={st2.accepted} "
+          f"接受率={st2.accept_rate:.3f} tokens/forward={st2.speedup:.3f} "
+          f"(随机 draft 接受率低属预期——无损性由 G15 机检；"
+          f"训练 draft 后接受率↑→加速趋近 1+α)", flush=True)
     return {"drafted": st.drafted, "accepted": st.accepted,
-            "accept_rate": st.accept_rate, "tokens_per_verify": st.speedup}
+            "accept_rate": st.accept_rate, "tokens_per_verify": st.speedup,
+            "gamma3_tokens_per_forward": st2.speedup}
 
 
 def main():

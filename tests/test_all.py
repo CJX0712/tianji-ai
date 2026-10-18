@@ -582,6 +582,99 @@ def test_spec_decode_statistical_lossless():
     assert st.accepted >= 1
 
 
+def test_spec_decode_gamma_fingerprint_and_algebra():
+    """γ>1 并行验证：位置指纹逐位一致（钉死 off-by-one 与状态回滚）+ 代数条件。
+
+    target/draft 同指纹（q=p）→ 全接受 + bonus，产出完全确定：
+    产出序列必须恰为指纹 1..9；每轮主干 forward 恰 1 次；tokens/forward = 3 > 1。
+    """
+    from types import SimpleNamespace
+    from tianji.l8_infer import TinyDraftGDN
+    V = 12
+
+    def finger(t):
+        z = np.zeros(V)
+        z[t % V] = 40.0
+        return z
+
+    class _T:
+        cfg = SimpleNamespace(mtp_depth=0)
+        calls = 0
+
+        def forward(self, x, **kw):
+            self.calls += 1
+            L = x.shape[1]
+            return {"logits": np.stack([finger(t + 1) for t in range(L)])[None],
+                    "aux": {}}
+
+    class _D:
+        # S = 已喂 token 栈：dm.S = 快照 赋值即回滚（与真实 GDN 状态语义一致）
+        def __init__(self):
+            self.S = []
+            self.last_logits = finger(0)
+
+        def warmup(self, tokens):
+            self.S = list(np.asarray(tokens).reshape(-1))
+            self.last_logits = finger(len(self.S))
+
+        def step(self, token):
+            self.S = [*self.S, int(token)]
+            return finger(len(self.S))
+
+    m = _T()
+    ids, st = speculative_decode(m, np.asarray([[0]], dtype=np.int64),
+                                 9, gamma=3, seed=5, draft_model=_D())
+    assert list(ids[1:]) == list(range(1, 10)), f"指纹序列破坏：{ids[1:]}"
+    assert m.calls == st.steps == 3, f"forward 次数错误：{m.calls} vs steps={st.steps}"
+    assert st.produced == 9 and st.speedup > 1.0, \
+        f"代数条件失败：produced={st.produced} steps={st.steps}"
+
+
+def test_spec_decode_gamma_statistical_lossless():
+    """γ>1 混合接受/拒绝路径统计无损 + 真实 TinyDraftGDN（已门禁 gdn_step）冒烟。"""
+    from types import SimpleNamespace
+    from tianji.l8_infer import TinyDraftGDN
+    V = 12
+    pb = np.arange(V, dtype=np.float64) * 0.7 - 3.0
+    pq = np.concatenate([np.full(3, 2.0), np.full(V - 3, -2.0)])
+    p = softmax(pb)
+
+    class _T:
+        cfg = SimpleNamespace(mtp_depth=0)
+
+        def forward(self, x, **kw):
+            L = x.shape[1]
+            return {"logits": np.broadcast_to(pb, (1, L, V)).copy(), "aux": {}}
+
+    class _D:
+        def __init__(self):
+            self.S = np.zeros((1, 1, 1, 1))
+            self.last_logits = pq.copy()
+
+        def warmup(self, tokens):
+            pass
+
+        def step(self, token):
+            return pq
+
+    ids, st = speculative_decode(_T(), np.asarray([[0]], dtype=np.int64),
+                                 4000, gamma=3, seed=13, draft_model=_D())
+    gen = np.asarray(ids[1:], dtype=np.int64)
+    assert gen.size == 4000
+    tv = 0.5 * float(np.abs(np.bincount(gen, minlength=V) / gen.size - p).sum())
+    assert tv < 0.05, f"γ>1 经验边际偏离 target：TV={tv:.4f}"
+    assert 0.0 < st.accept_rate < 1.0
+    # ---- 真实 TinyDraftGDN（gdn_step 递推）冒烟：结构正确、输出有限、接口完整
+    d = TinyDraftGDN(V, d=16, seed=3)
+    d.warmup([1, 2, 3])
+    lg = d.step(4)
+    assert lg.shape == (V,) and np.all(np.isfinite(lg))
+    ids2, st2 = speculative_decode(_T(), np.asarray([[1, 2]], dtype=np.int64),
+                                   20, gamma=2, seed=7, draft_model=d)
+    assert len(ids2) == 22 and st2.produced == 20
+    assert st2.steps >= 1 and np.all(np.isfinite(np.asarray(ids2)))
+
+
 # ============================================================ 门禁
 
 def test_all_gates():

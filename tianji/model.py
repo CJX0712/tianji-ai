@@ -243,15 +243,22 @@ class TianjiModel:
         out = {"logits": logits, "xf": xf, "loss": None, "aux": {}}
         self._tail = dict(cf=cf, xf=xf, W=W)
 
+        if cfg.mtp_depth > 0:
+            # MTP logits 对**推理期也导出**：投机解码（G14）的 draft 分布依赖它。
+            # logits2 本身不依赖 targets（targets 只用于 CE loss）——
+            # 旧版把 MTP 计算整个锁在 targets 块内，导致推理期拿不到 draft
+            # 分布、投机解码退化为恒接受空壳（已修复，2026-10-19）。
+            lm2, cmtp = self._mtp_fwd(xf, tokens, targets)
+            out["mtp_logits"] = cmtp["logits2"]
+        else:
+            cmtp = None
+
         if targets is not None:
             cce = Ctx()
             lm = float(CE.forward(cce, logits, targets))
             out["aux"]["loss_main"] = lm
             loss = lm
-            cmtp = None
             if cfg.mtp_depth > 0:
-                lm2, cmtp = self._mtp_fwd(xf, tokens, targets)
-                out["mtp_logits"] = cmtp["logits2"]
                 out["aux"]["loss_mtp"] = lm2
                 loss = loss + cfg.mtp_lambda * lm2
             self._tail.update(cce=cce, cmtp=cmtp, targets=targets, tokens=tokens)
@@ -399,7 +406,7 @@ class TianjiModel:
         c = Ctx()
         return SWIGLU.forward(c, h, P[p + "Wg"], P[p + "Wu"], P[p + "Wd"]), {"cf": c}
 
-    def _mtp_fwd(self, xf, tokens, targets):
+    def _mtp_fwd(self, xf, tokens, targets=None):
         """多令牌预测（DeepSeek-V3 MTP 的轻量版）。
 
         V3 原版：额外堆一个完整 Transformer 层，输入 = RMSNorm(h_t) ⊕ Emb(t_{t+1})。
@@ -407,6 +414,8 @@ class TianjiModel:
         为什么这样取舍：CPU 上多堆一层会让每步训练时间翻倍，而 MTP 的收益
         （更密集的监督信号 + 推理期可当投机解码的 draft）主要来自
         「额外的预测头」本身。这一点在文档中明确标注，不做模糊处理。
+
+        targets=None（推理期）时只返回 logits2，不算 CE loss。
         """
         cfg, P = self.cfg, self.P
         B, T, d = xf.shape
@@ -415,9 +424,12 @@ class TianjiModel:
         en, c_en = self._rms(P["tok_emb"][nxt], P["mtp_emb_norm_w"])
         hp = LINEAR.forward(c1 := Ctx(), np.concatenate([hn, en], axis=-1), P["W_mtp_proj"])
         logits2 = hp @ self.head_w().T
-        tgt2 = np.concatenate([targets[:, 1:], np.full((B, 1), -1)], axis=1)
-        c2 = Ctx()
-        lm = float(CE.forward(c2, logits2, tgt2))
+        c2 = None
+        lm = None
+        if targets is not None:
+            tgt2 = np.concatenate([targets[:, 1:], np.full((B, 1), -1)], axis=1)
+            c2 = Ctx()
+            lm = float(CE.forward(c2, logits2, tgt2))
         return lm, {"c1": c1, "c2": c2, "c_hn": c_hn, "c_en": c_en,
                     "nxt": nxt, "hp": hp, "logits2": logits2}
 

@@ -29,6 +29,12 @@
                     draft==target / target 含零 / draft 高度集中，机器精度）；
                     (b) 端到端统计（mock 双分布模型 6000 token，经验边际 TV 距离）
                     + 接受率 ∈ (0,1)（I5 有效性）。加速边界如实声明（结构性 ≈1）
+    G15 投机解码并行验证 独立轻量 draft（TinyDraftGDN，复用已门禁 gdn_step）+ γ>1 一次
+                    batch 验证：(a) 位置指纹确定性测试 —— target logits 按位置编码，
+                    q=p 全接受场景下产出序列必须逐位等于指纹（钉死 verify forward
+                    的位置对齐 off-by-one 与 draft 状态快照回滚）；(b) 代数条件：
+                    每轮主干 forward 恰 1 次、tokens/forward > 1（全接受 γ+1）；
+                    (c) 混合接受/拒绝统计无损（TV）+ 接受率 ∈ (0,1)
 """
 
 from __future__ import annotations
@@ -438,6 +444,93 @@ def run_all_gates(seed: int = 0, steps: int = 60, verbose: bool = True) -> GateR
         f"解析恒等最大差 {worst14:.2e}；6000 token 经验边际 TV={tv:.4f}；"
         f"接受率 {st14.accept_rate:.3f}（∈(0,1) 有效 drafting；加速边界结构性 ≈1 已如实声明）",
         analytic=worst14, tv=tv, accept_rate=st14.accept_rate)
+    R.results[-1].seconds = time.time() - t0
+
+    # ---------------------------------------------------------- G15 投机解码并行验证
+    # 独立轻量 draft（TinyDraftGDN 复用已门禁 gdn_step）+ γ>1 一次 batch 验证。
+    # (a) 位置指纹：target logits[0,t] = onehot((t+1) mod V)·40 近确定性；
+    #     draft 与 target 同指纹（q=p）→ 全接受 + bonus，产出序列完全确定，
+    #     逐位断言 == 指纹 —— 任何 verify 位置对齐 off-by-one 或 draft 状态
+    #     快照回滚错误都会立刻破坏该序列。
+    # (b) 代数条件：每轮主干 forward 恰 1 次；tokens/forward = 9/3 = 3 > 1。
+    # (c) 统计无损：target 恒定偏斜 p、draft 恒定偏斜 q≠p（混合接受/拒绝
+    #     /重采样路径），4000 token 经验边际 TV 必须小；接受率 ∈ (0,1)。
+    t0 = time.time()
+    from .l8_infer import TinyDraftGDN, speculative_decode as _spec15
+    V15 = 12
+
+    def _finger(t: int) -> np.ndarray:
+        z = np.zeros(V15)
+        z[t % V15] = 40.0
+        return z
+
+    class _FTarget:
+        cfg = SimpleNamespace(mtp_depth=0)
+
+        def __init__(self):
+            self.calls = 0
+
+        def forward(self, x, **kw):
+            self.calls += 1
+            L = x.shape[1]
+            return {"logits": np.stack([_finger(t + 1) for t in range(L)])[None],
+                    "aux": {}}
+
+    class _FDraft:
+        # S = 已喂 token 栈：dm.S = 快照 赋值即回滚（与真实 GDN 状态语义一致）
+        def __init__(self):
+            self.S = []
+            self.last_logits = _finger(0)
+
+        def warmup(self, tokens):
+            self.S = list(np.asarray(tokens).reshape(-1))
+            self.last_logits = _finger(len(self.S))
+
+        def step(self, token):
+            self.S = [*self.S, int(token)]
+            return _finger(len(self.S))
+
+    m15 = _FTarget()
+    ids15, st15 = _spec15(m15, np.asarray([[0]], dtype=np.int64), 9,
+                          gamma=3, seed=5, draft_model=_FDraft())
+    expect15 = list(range(1, 10))                       # 产出应恰为指纹 1..9
+    pos_ok = list(ids15[1:]) == expect15
+    algebra_ok = (m15.calls == st15.steps and st15.produced == 9
+                  and st15.speedup > 1.0)
+    # ---- (c) 混合路径统计无损
+    pb15 = np.arange(V15, dtype=np.float64) * 0.7 - 3.0
+    pq15 = np.concatenate([np.full(3, 2.0), np.full(V15 - 3, -2.0)])
+    p15 = softmax(pb15)
+
+    class _CTarget:
+        cfg = SimpleNamespace(mtp_depth=0)
+
+        def forward(self, x, **kw):
+            L = x.shape[1]
+            return {"logits": np.broadcast_to(pb15, (1, L, V15)).copy(), "aux": {}}
+
+    class _CDraft:
+        def __init__(self):
+            self.S = np.zeros((1, 1, 1, 1))
+            self.last_logits = pq15.copy()
+
+        def warmup(self, tokens):
+            pass
+
+        def step(self, token):
+            return pq15
+
+    idsc, stc = _spec15(_CTarget(), np.asarray([[0]], dtype=np.int64), 4000,
+                        gamma=3, seed=13, draft_model=_CDraft())
+    freqc = np.bincount(np.asarray(idsc[1:], dtype=np.int64), minlength=V15) / 4000
+    tvc = 0.5 * float(np.abs(freqc - p15).sum())
+    ok15 = pos_ok and algebra_ok and tvc < 0.05 and 0.0 < stc.accept_rate < 1.0
+    add("投机解码并行验证", ok15,
+        f"位置指纹逐位一致={pos_ok}；主干 forward {m15.calls} 次/产出 9 token"
+        f"（tokens/forward={9 / max(m15.calls, 1):.1f}>1）；"
+        f"混合路径 4000 token TV={tvc:.4f}；接受率 {stc.accept_rate:.3f}∈(0,1)",
+        fingerprint=pos_ok, calls=m15.calls, tv=tvc,
+        accept_rate=stc.accept_rate)
     R.results[-1].seconds = time.time() - t0
 
     return R

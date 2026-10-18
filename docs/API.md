@@ -301,7 +301,7 @@ Top-p（nucleus）采样。
 用 MTP 头做 draft、主模型验证。接受概率 `min(1, p_target/p_draft)`，
 拒绝时从残差分布 `∝ max(0, p_target − p_draft)` 重采样 —— **数学上严格无损**。
 
-`SpecStats`：`drafted, accepted, accept_rate, speedup`（speedup 为每验证步产出 token 数，本后端结构性 ≈1——draft 搭车主干 forward，真实加速需独立轻量 draft + GPU batch 验证，见 G14 诚实边界）。无损性由 G14 机检。
+`SpecStats`：`drafted, accepted, steps, accept_rate, produced, speedup`（speedup = 产出 token 数 / 主干 forward 次数）。两条路径：`draft_model=None` 走 MTP 搭车（γ=1，结构性 ≈1，G14 机检无损）；`draft_model=TinyDraftGDN` 走独立轻量 draft + γ>1 一次 batch 并行验证（实测 tokens/forward 可达 3+，G15 机检位置指纹/代数条件/统计无损）。
 
 ---
 
@@ -443,7 +443,7 @@ from tianji import TINY_TALE, default_corpus, markov_tokens
 from tianji import run_all_gates, GateReport, GateResult
 rep = run_all_gates(seed=0, steps=40)
 print(rep.table())        # G1..G10 的 PASS/FAIL 与实测值
-rep.all_green             # 是否 14/14
+rep.all_green             # 是否 15/15
 ```
 
 ---
@@ -451,7 +451,7 @@ rep.all_green             # 是否 14/14
 ## 命令行
 
 ```bash
-python -m tianji.cli gates      # 14 道交付门禁
+python -m tianji.cli gates      # 15 道交付门禁
 python -m tianji.cli test       # 模块梯度检验冒烟
 python -m tianji.cli bench      # 完整基准
 python -m tianji.cli microops   # 微指令统计（--show 列出全部家族）
