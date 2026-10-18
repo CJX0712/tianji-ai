@@ -142,6 +142,100 @@ def test_bpe_compression():
     assert len(ids) < len(corpus)
 
 
+def test_bpe_lone_surrogate_roundtrip():
+    """孤立代理项（lone surrogate）往返无损 —— WTF-8 语义。
+
+    G18 对抗探针抓出的真实缺陷：严格 UTF-8 在这些输入上直接
+    UnicodeEncodeError 崩溃（JSON \\ud800 转义、截断文件会 legitimately
+    产生它们）。修复 = errors="surrogatepass"，与 Rust String /
+    HF tokenizers 的 WTF-8 内部表示一致。
+    """
+    corpus = ("the quick brown fox " * 50 + "天玑" * 50)
+    bpe = BPE(vocab_size=300).train(corpus)
+    for s in ["\ud800", "a\udfffb", "\ud83d\ude00", "x\ud800y\udbffz"]:
+        assert bpe.decode(bpe.encode(s)) == s
+
+
+def test_bpe_adversarial_roundtrip():
+    """16 类极端输入全部往返一致（G18 门禁 T5 的单测镜像）。"""
+    corpus = ("the quick brown fox jumps over the lazy dog. " * 20 +
+              "to be or not to be, that is the question. " * 20 +
+              "天玑是世界上最好的东西。" * 10)
+    bpe = BPE(vocab_size=320).train(corpus)
+    cases = [
+        "", "a", "\ud800", "a\udfffb", "Hello 🎉🚀 world", "a\x00b",
+        "   \t\n\r  ", "混合 mixed 文本 with English 123", "\ufffd\uffff",
+        "e\u0301e\u0301", "\U0001F468\u200D\U0001F469\u200D\U0001F467",
+        "ab" * 2000, "\ufeffhello", "a\ufe0f", "\U000E0001\U000E0020",
+        "\U0010FFFF",
+    ]
+    for s in cases:
+        assert bpe.decode(bpe.encode(s)) == s, repr(s)[:40]
+
+
+def test_bpe_empty_special_token_rejected():
+    """空特殊 token 必须响亮失败 —— 曾静默产生字符间垃圾 id（G18 T11）。"""
+    try:
+        BPE(vocab_size=320, special=("",))
+    except ValueError:
+        return
+    raise AssertionError("空特殊 token 应抛出 ValueError")
+
+
+def test_bpe_fixed_point_and_save_load():
+    """不动点 encode(decode(encode(s)))==encode(s) + save/load 逐位一致。"""
+    import os
+    import random
+    import tempfile
+    corpus = ("the quick brown fox jumps over the lazy dog. " * 20 +
+              "天玑是世界上最好的东西。" * 10)
+    bpe = BPE(vocab_size=320).train(corpus)
+    rr = random.Random(5)
+    for _ in range(60):
+        s = "".join(chr(rr.randint(1, 0x4FFF)) for _ in range(rr.randint(0, 20)))
+        i1 = bpe.encode(s)
+        assert bpe.encode(bpe.decode(i1)) == i1
+    probe = "天玑 the quick <|endoftext|> brown 🎉 123"
+    with tempfile.TemporaryDirectory() as d:
+        p = os.path.join(d, "vocab.txt")
+        bpe.save(p)
+        b2 = BPE.load(p)
+        assert b2.encode(probe) == bpe.encode(probe)
+        assert b2.vocab == bpe.vocab and b2.merges == bpe.merges
+
+
+def test_bpe_vocab_injective_and_merge_graph():
+    """词表单射 + merge 图 vocab[nid]==vocab[a]+vocab[b] + ranks 插入序。"""
+    corpus = ("the quick brown fox jumps over the lazy dog. " * 20 +
+              "天玑是世界上最好的东西。" * 10)
+    bpe = BPE(vocab_size=320).train(corpus)
+    seen = set()
+    for b in bpe.vocab.values():
+        assert b not in seen, "词表存在重复字节串（不再单射）"
+        seen.add(b)
+    for (a, b), nid in bpe.merges.items():
+        assert bpe.vocab[nid] == bpe.vocab[a] + bpe.vocab[b]
+    for r, p in enumerate(sorted(bpe.merges, key=lambda k: bpe.merges[k])):
+        assert bpe.ranks[p] == r
+
+
+def test_pretokenize_lossless():
+    """concat(pretokenize(x)) == x 对随机 Unicode 串成立。"""
+    import random
+    rr = random.Random(9)
+    for _ in range(200):
+        x = "".join(chr(rr.randint(1, 0x9FFF)) for _ in range(rr.randint(0, 25)))
+        assert "".join(pretokenize(x)) == x, repr(x)[:50]
+
+
+def test_bpe_decode_corrupt_stream_degrades():
+    """非 encode 产物的损坏字节流：surrogatepass 严格解码失败 → replace 降级。"""
+    bpe = BPE(vocab_size=300).train("the quick brown fox " * 50)
+    out = bpe.decode([0xFF, 0xFE])          # 非法 UTF-8、非代理项序列
+    assert isinstance(out, str)             # 不抛异常，静默替换为 U+FFFD
+    assert out == "\ufffd\ufffd"
+
+
 # ============================================================ L3 原语
 
 def test_rope_preserves_norm():

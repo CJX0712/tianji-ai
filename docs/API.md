@@ -443,7 +443,7 @@ from tianji import TINY_TALE, default_corpus, markov_tokens
 from tianji import run_all_gates, GateReport, GateResult
 rep = run_all_gates(seed=0, steps=40)
 print(rep.table())        # G1..G10 的 PASS/FAIL 与实测值
-rep.all_green             # 是否 17/17
+rep.all_green             # 是否 18/18
 ```
 
 ---
@@ -451,7 +451,7 @@ rep.all_green             # 是否 17/17
 ## 命令行
 
 ```bash
-python -m tianji.cli gates      # 17 道交付门禁
+python -m tianji.cli gates      # 18 道交付门禁
 python -m tianji.cli test       # 模块梯度检验冒烟
 python -m tianji.cli bench      # 完整基准
 python -m tianji.cli microops   # 微指令统计（--show 列出全部家族）

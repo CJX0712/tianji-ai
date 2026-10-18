@@ -95,7 +95,7 @@ the quick brown fox. to be or not to be,
 |---|---|---|
 | **L0** | 数值内核 | logsumexp 稳定化（LAPACK 传统）、Newton-Schulz 正交化（Muon 公开系数 3.4445/−4.7750/2.0315）、BLAKE2b 派生种子 |
 | **L1** | 反向契约 | 显式 `backward` 契约 + 中心差分梯度检验（PyTorch `gradcheck` 同款判据） |
-| **L2** | 分词 | 字节级 BPE（Sennrich 2016 + GPT-2/tiktoken 预分词），含 CJK 单字切分改进 |
+| **L2** | 分词 | 字节级 BPE（Sennrich 2016 + GPT-2/tiktoken 预分词），含 CJK 单字切分改进；WTF-8 字节契约（孤立代理项无损，G18 抓出严格 UTF-8 崩溃缺陷后修复） |
 | **L3** | 架构原语 | RMSNorm、RoPE、SwiGLU、GQA、**MLA**（低秩 KV + 解耦 RoPE） |
 | **L4** | 序列混合 | **Gated DeltaNet**（delta rule + 遗忘门，沿时间反向递推） |
 | **L5** | 稀疏化 | **DeepSeek-V3 MoE**（sigmoid 亲和度 + 无辅助损失动态偏置 + 共享专家） |
@@ -103,7 +103,7 @@ the quick brown fox. to be or not to be,
 | **L7** | 训练 | 余弦 / WSD 调度、梯度累积、梯度裁剪、bits-per-byte 度量 |
 | **L8** | 推理 | KV 状态缓存、per-channel INT8 / group-wise INT4、MTP 投机解码 |
 | **L9** | 对齐 | DPO / IPO / SimPO / KTO，统一走 `backward(g_logits=...)` 入口 |
-| **L10** | 微指令 + 门禁 | **1024 条可执行微指令**（32 家族 × 32）+ 17 道交付门禁 |
+| **L10** | 微指令 + 门禁 | **1024 条可执行微指令**（32 家族 × 32）+ 18 道交付门禁 |
 
 完整推导与逐层详解见 [ARCHITECTURE.md](ARCHITECTURE.md)。
 
@@ -141,6 +141,7 @@ Pre-RMSNorm → Mixer(GDN 或 MLA) → 残差 → Pre-RMSNorm → FFN(MoE 或 De
 | G15 投机解码并行验证 | 独立轻量 draft（TinyDraftGDN 复用已门禁 gdn_step）+ γ>1 一次 batch 验证：位置指纹逐位一致（钉死 off-by-one 与状态回滚）+ tokens/forward>1 代数条件 + 混合路径统计无损 | 指纹✅ / 3.0 / TV=0.0147 |
 | G16 对齐正确性 | DPO/IPO/SimPO/KTO 首次全机检：解析值（Δ=0→log2、IPO 有限目标 Δ*=τ/2β 系数=0）+ grad_logprob 中心差分 + DPO 端到端参数梯度中心差分 + 方向 chosen↑/rejected↓ + SimPO 长度不变 + ref 零漂移 | 8.9e-11 / 方向✅ |
 | G17 MoE 路由不变性 | M2-M5 全机检 + 64 组对抗 fuzz（输入/router/bias 三轴极端）：门控行和==1（曾抓出 Σ+1e-12 加法偏置致归一化塌陷，已修复）、mask 行和恒==K、专家计算量==N·K、垄断场景无丢弃、偏置控制器 clip/maxcv 语义 | 2.22e-16 |
+| G18 分词器对抗 fuzz | T5-T11 全机检 + 对抗 fuzz：16 类极端输入往返（含孤立代理项——曾抓出严格 UTF-8 直接 UnicodeEncodeError 崩溃，已修复为 WTF-8 语义，与 Rust String/HF tokenizers 一致）、300 条随机 Unicode、词表单射/merge 图/ranks 插入序/id 闭合、save→load 逐位一致、warm-cold 缓存一致、不动点、预分词无损、空特殊 token 误配置守卫 | 0 失败 |
 
 **门禁的态度：失败就如实报失败，不允许放宽阈值凑绿。**
 
@@ -167,7 +168,7 @@ Pre-RMSNorm → Mixer(GDN 或 MLA) → 残差 → Pre-RMSNorm → FFN(MoE 或 De
 | A12 | 推理吞吐 | > 50 tok/s | **465 tok/s** |
 | A13 | 运行时依赖 | == 1 | **`['numpy']`** |
 | A14 | 单元测试 | 41/41 | **41/41** |
-| A15 | 交付门禁 | 17/17 | **17/17** |
+| A15 | 交付门禁 | 18/18 | **18/18** |
 | A16 | 断网可运行 | 0 处网络依赖 | **0** |
 
 三条判据的设定依据（A3 为何是 10%、A7 为何用权重误差、A8 为何放宽到 15%）
@@ -197,7 +198,7 @@ python scripts/quickstart.py          # 最小示例，约 10 秒
 2. 模型   4 层 布局=LLLA (A=MLA, L=GatedDeltaNet)，参数 252,032
 4. 训练   30 步 2.4s，loss 6.8636 -> 0.2036
 6. 生成   结果='the quick brown fox jumps over the lazy dog. ...'
-7. 门禁   17/17 通过
+7. 门禁   18/18 通过
 ✅ 全部通过
 ```
 
@@ -244,8 +245,8 @@ make verify-all        # 测试 + 门禁 + 最小示例（交付自查）
 
 ```bash
 docker build -t tianji:latest .
-docker run --rm tianji:latest gates      # 跑 17 道门禁
-docker run --rm tianji:latest test       # 跑 51 个测试
+docker run --rm tianji:latest gates      # 跑 18 道门禁
+docker run --rm tianji:latest test       # 跑 58 个测试
 
 docker compose run --rm tianji train     # 训练，产物落在 ./runs
 docker compose run --rm tianji generate  # 推理
@@ -282,8 +283,8 @@ python bench/run_bench.py --steps 120 --seed 0     # 约 2 分钟，写 bench/re
 
 ```bash
 make help          # 查看全部目标
-make test          # 51 个单元测试
-make gates         # 17 道交付门禁
+make test          # 58 个单元测试
+make gates         # 18 道交付门禁
 make bench         # 完整基准
 make quickstart    # 最小示例
 make train         # 训练
@@ -360,7 +361,7 @@ NumPy 2.5.4 纯 CPU、合成 2 阶马尔可夫语料（vocab=64）、d_model=64 
 | 训练 | ✅ CPU 可训 | ✅ GPU | ❌ | ✅ GPU |
 | 量化 / 投机解码 | ✅ | ❌ | ✅ | ❌ |
 | 对齐（DPO 等） | ✅ | ❌ | ❌ | ❌ |
-| **可证门禁** | **✅ 17 道** | ❌ | ❌ | 部分 |
+| **可证门禁** | **✅ 18 道** | ❌ | ❌ | 部分 |
 | 吞吐 | 低（NumPy CPU） | 高 | 极高 | 极高 |
 
 **诚实的结论**：本项目**不追求吞吐**。它的对标对象是「正确性可独立验证的研究级实现」，
@@ -464,7 +465,7 @@ tianji-ai/
 │   ├── model.py               3:1 混合模型组装
 │   ├── persist.py             checkpoint 保存/加载 + sha256 校验
 │   ├── data.py                内置离线语料
-│   ├── verify.py              17 道交付门禁
+│   ├── verify.py              18 道交付门禁
 │   └── cli.py                 命令行入口
 ├── scripts/
 │   ├── reproduce.sh             一键复现（Linux / macOS，无需 Docker）
@@ -476,7 +477,7 @@ tianji-ai/
 │   └── test_model.py            模型配置冒烟
 ├── docs/
 │   └── API.md                   完整 API 说明（L0–L10 全部接口）
-├── tests/test_all.py          51 个单元测试
+├── tests/test_all.py          58 个单元测试
 ├── bench/                     基准脚本 + 结果（bench.json）
 ├── Dockerfile                 一键环境（python:3.11-slim）
 ├── docker-compose.yml         挂载 ./runs 的训练/推理

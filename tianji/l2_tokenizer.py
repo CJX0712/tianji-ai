@@ -23,6 +23,30 @@
     T2 词表闭合：所有 merge 产出的 id 都在 [0, vocab_size)
     T3 压缩性：编码长度 < 字符数（在多数字语料上）
     T4 确定性：同语料训练两次，词表逐位相同
+    T5 对抗往返：孤立代理项/emoji/NUL/BOM/组合字符/ZWJ 等 16 类极端输入
+       全部 decode(encode(s)) == s（G18 门禁）
+    T6 随机 fuzz：300 条随机 Unicode 串往返一致（G18 门禁）
+    T7 词表单射：vocab 字节串无重复；merge 图 vocab[nid]==vocab[a]+vocab[b]；
+       ranks 与插入序一致（G18 门禁）
+    T8 存取一致：save→load 后 encode 逐位一致（G18 门禁）
+    T9 缓存一致：warm cache encode == cold encode；不动点
+       encode(decode(encode(s))) == encode(s)（G18 门禁）
+    T10 预分词无损：concat(pretokenize(x)) == x（G18 门禁）
+
+字节级契约与 WTF-8（为什么用 surrogatepass）：
+    字节级 BPE 的数学契约是「str ↔ 字节序列的双射」。Python 的 str 可以含有
+    孤立代理项（lone surrogate，U+D800..U+DFFF）—— JSON 的 \\ud800 转义、
+    截断的 UTF-16 文件、损坏的数据管道都会产生它们。严格 UTF-8 编码在这些
+    输入上直接抛 UnicodeEncodeError（G18 对抗探针实测），而 errors="replace"
+    会把它们静默替换为 '?'——往返丢失，正是本项目追杀的那类「不报错但数据
+    被静默污染」缺陷。
+    世界级实现的选择：Rust 的 String 内部即 WTF-8（HF tokenizers 的同款
+    语义），孤立代理项有确定的三字节表示（ED A0..BF ...）且无损。Python 标准
+    库的 errors="surrogatepass" 提供同一语义。因此：
+        编码侧：text.encode("utf-8", errors="surrogatepass")
+        解码侧：先按 surrogatepass 严格解码（恢复全部合法输入，含代理项）；
+                仅在字节流确实损坏（非 encode 产物）时回退 errors="replace"
+    这样 (a) 一切合法 str 输入往返逐位无损，(b) 损坏 token 流仍优雅降级。
 """
 
 from __future__ import annotations
@@ -34,6 +58,15 @@ from typing import Iterable, Sequence
 __all__ = ["BPE", "pretokenize", "BYTE_BASE"]
 
 BYTE_BASE = 256
+
+
+def _utf8(text: str) -> bytes:
+    """str → 字节序列，WTF-8 语义（孤立代理项无损）。
+
+    errors="surrogatepass"：U+D800..U+DFFF 编为确定的三字节序列，
+    与 Rust String / HF tokenizers 的 WTF-8 内部表示一致。
+    """
+    return text.encode("utf-8", errors="surrogatepass")
 
 # GPT-2 的英文缩略语簇。放在词表最前面，避免 "don't" 被切成 "don" + "'t" 的劣化解。
 _CONTRACTIONS = ("'s", "'t", "'re", "'ve", "'m", "'ll", "'d", "'S", "'T", "'RE", "'VE", "'M", "'LL", "'D")
@@ -166,7 +199,12 @@ class BPE:
         self._special_re: re.Pattern | None = None
         nxt = BYTE_BASE
         for s in self.special:
-            self.vocab[nxt] = s.encode("utf-8")
+            if s == "":
+                raise ValueError(
+                    "特殊 token 不能为空字符串：空模式会在任意位置匹配，"
+                    "使编码退化为字符间插入垃圾 id（G18 门禁 T11 误配置守卫）"
+                )
+            self.vocab[nxt] = _utf8(s)
             nxt += 1
         self._next_id = nxt
         self._cache: dict[str, tuple[int, ...]] = {}
@@ -188,9 +226,9 @@ class BPE:
         for chunk in text:
             counts.update(pretokenize(chunk))
 
-        # 每个预分词块表示为字节 id 元组
+        # 每个预分词块表示为字节 id 元组（WTF-8：孤立代理项无损，见模块 docstring）
         words: dict[str, tuple[int, ...]] = {
-            w: tuple(w.encode("utf-8")) for w in counts
+            w: tuple(_utf8(w)) for w in counts
         }
 
         while self._next_id < self.vocab_size:
@@ -275,7 +313,7 @@ class BPE:
             for w in pretokenize(ch):
                 ids = self._cache.get(w)
                 if ids is None:
-                    ids = self._encode_chunk(tuple(w.encode("utf-8")))
+                    ids = self._encode_chunk(tuple(_utf8(w)))
                     self._cache[w] = ids
                 out.extend(ids)
         return out
@@ -284,7 +322,13 @@ class BPE:
         buf = bytearray()
         for i in ids:
             buf.extend(self.vocab[int(i)])
-        return buf.decode("utf-8", errors="replace")
+        # 先按 WTF-8 严格解码：encode 的产物（含孤立代理项的三字节序列）
+        # 在此路径上逐位恢复；仅当字节流确实损坏（非本 tokenizer 的
+        # encode 产物）时才回退 replace —— 合法输入永不静默降级。
+        try:
+            return buf.decode("utf-8", errors="surrogatepass")
+        except UnicodeDecodeError:
+            return buf.decode("utf-8", errors="replace")
 
     # ------------------------------------------------------------ 工具
 

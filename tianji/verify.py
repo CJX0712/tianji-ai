@@ -54,6 +54,16 @@
                     覆盖无丢弃；(d) 偏置控制器：均衡零偏置、过载单调下降、
                     clip 边界、maxcv 空历史=inf；(e) 均衡损失 f-detach 语义
                     解析梯度 + 中心差分
+    G18 分词器对抗 fuzz  T5-T11 全部机检 + 对抗 fuzz：(a) 16 类极端输入往返
+                    （含孤立代理项）—— 本门禁探针抓出「lone surrogate 输入
+                    直接抛 UnicodeEncodeError 崩溃」的真实缺陷（已修复为
+                    WTF-8 语义 surrogatepass，与 Rust String/HF tokenizers
+                    一致）；(b) 300 条随机 Unicode fuzz；(c) 词表单射、
+                    merge 图 vocab[nid]==vocab[a]+vocab[b]、ranks 插入序、
+                    id 闭合；(d) save→load 逐位一致；(e) warm/cold 缓存
+                    一致 + 不动点 encode(decode(encode(s)))==encode(s)；
+                    (f) 预分词无损 concat；(g) 误配置守卫：空特殊 token
+                    必须 ValueError（曾静默产生字符间垃圾 id）
 """
 
 from __future__ import annotations
@@ -739,6 +749,113 @@ def run_all_gates(seed: int = 0, steps: int = 60, verbose: bool = True) -> GateR
         f"（均衡零偏置={eq_ok}/过载下降={bias_ok}/clip 与 maxcv=inf={cv_ok}）；"
         f"均衡损失 detach 梯度中心差分 {cv_worst:.2e}",
         gate_worst=worst17, flops=flops_ok, balance=bias_ok, cv=cv_worst)
+    R.results[-1].seconds = time.time() - t0
+
+    # ---------------------------------------------------------- G18 分词器对抗 fuzz
+    t0 = time.time()
+    import os
+    import random as _random
+    import tempfile
+    from .l2_tokenizer import BPE as _BPE18, pretokenize as _pretok18
+    g18 = rng(spawn_seed(seed, "tok"))
+    corpus18 = ("the quick brown fox jumps over the lazy dog. " * 20 +
+                "to be or not to be, that is the question. " * 20 +
+                "天玑是世界上最好的东西。" * 10)
+    tok = _BPE18(vocab_size=320).train(corpus18)
+
+    # ---- (a) T5 对抗往返：16 类极端输入（G18 探针实测抓出孤立代理项崩溃）
+    # 异常安全：缺陷存在时本门禁必须「报 FAIL」而不是掀翻整个门禁套件
+    adv18 = [
+        "", "a", "\ud800", "a\udfffb", "Hello 🎉🚀 world", "a\x00b",
+        "   \t\n\r  ", "混合 mixed 文本 with English 123", "\ufffd\uffff",
+        "e\u0301e\u0301", "\U0001F468\u200D\U0001F469\u200D\U0001F467",
+        "ab" * 2000, "\ufeffhello", "a\ufe0f", "\U000E0001\U000E0020",
+        "\U0010FFFF",
+    ]
+    rt_bad18: list = []
+    for s in adv18:
+        try:
+            if tok.decode(tok.encode(s)) != s:
+                rt_bad18.append(s)
+        except Exception as e:                    # noqa: BLE001 —— 缺陷即失败
+            rt_bad18.append(f"{s!r}: {type(e).__name__}")
+
+    # ---- (b) T6 随机 Unicode fuzz（同样异常安全）
+    rr = _random.Random(spawn_seed(seed, "tokfuzz") % (2**31))
+    fuzz_bad18 = 0
+    for _ in range(300):
+        s = "".join(chr(rr.randint(1, 0x4FFF)) for _ in range(rr.randint(0, 30)))
+        try:
+            if tok.decode(tok.encode(s)) != s:
+                fuzz_bad18 += 1
+        except Exception:                        # noqa: BLE001 —— 缺陷即失败
+            fuzz_bad18 += 1
+
+    # ---- (c) T7 词表单射 + merge 图一致 + ranks 插入序 + id 闭合
+    seen18: set[bytes] = set()
+    dup18 = 0
+    for b in tok.vocab.values():
+        if b in seen18:
+            dup18 += 1
+        seen18.add(b)
+    graph18 = all(tok.vocab[nid] == tok.vocab[a] + tok.vocab[b]
+                  for (a, b), nid in tok.merges.items())
+    ranks18 = all(tok.ranks[p] == r for r, p in
+                  enumerate(sorted(tok.merges, key=lambda k: tok.merges[k])))
+    closed18 = all(0 <= i < tok.size for i in tok.vocab)
+
+    # ---- (d) T8 存取一致
+    with tempfile.TemporaryDirectory() as _td18:
+        _p18 = os.path.join(_td18, "vocab.txt")
+        tok.save(_p18)
+        tok2 = _BPE18.load(_p18)
+        sl18 = (tok2.encode("天玑 the quick <|endoftext|> brown 🎉 123")
+                == tok.encode("天玑 the quick <|endoftext|> brown 🎉 123")
+                and tok2.vocab == tok.vocab and tok2.merges == tok.merges)
+
+    # ---- (e) T9 缓存一致（warm==cold）+ 不动点
+    cold18 = _BPE18(vocab_size=320).train(corpus18)
+    warm18 = _BPE18(vocab_size=320).train(corpus18)
+    probe18 = "the quick 天玑 brown fox"
+    warm18.encode(probe18)
+    cache18 = warm18.encode(probe18) == cold18.encode(probe18)
+    fp_bad18 = 0
+    for _ in range(100):
+        s = "".join(chr(rr.randint(1, 0x4FFF)) for _ in range(rr.randint(0, 20)))
+        try:
+            i1 = tok.encode(s)
+            if tok.encode(tok.decode(i1)) != i1:
+                fp_bad18 += 1
+        except Exception:                        # noqa: BLE001 —— 缺陷即失败
+            fp_bad18 += 1
+
+    # ---- (f) T10 预分词无损
+    pt_bad18 = 0
+    for _ in range(200):
+        x = "".join(chr(rr.randint(1, 0x9FFF)) for _ in range(rr.randint(0, 25)))
+        if "".join(_pretok18(x)) != x:
+            pt_bad18 += 1
+
+    # ---- (g) T11 误配置守卫：空特殊 token 必须响亮失败
+    try:
+        _BPE18(vocab_size=320, special=("",))
+        guard18 = False
+    except ValueError:
+        guard18 = True
+
+    ok18 = (not rt_bad18 and fuzz_bad18 == 0 and dup18 == 0 and graph18
+            and ranks18 and closed18 and sl18 and cache18 and fp_bad18 == 0
+            and pt_bad18 == 0 and guard18)
+    add("分词器对抗 fuzz", ok18,
+        f"T5 对抗往返 {len(adv18)} 类极端输入（含孤立代理项，WTF-8 修复）"
+        f"失败 {len(rt_bad18)}；T6 随机 Unicode 300 条失败 {fuzz_bad18}；"
+        f"T7 词表单射（重复 {dup18}）/merge 图一致={graph18}/ranks 插入序="
+        f"{ranks18}/id 闭合={closed18}；T8 save→load 逐位一致={sl18}；"
+        f"T9 缓存一致={cache18}、不动点失败 {fp_bad18}/100；"
+        f"T10 预分词无损失败 {pt_bad18}/200；T11 空特殊 token 守卫={guard18}",
+        adv_fail=len(rt_bad18), fuzz_fail=fuzz_bad18, dup=dup18,
+        graph=graph18, ranks=ranks18, closed=closed18, save_load=sl18,
+        cache=cache18, fixed_point=fp_bad18, pretok=pt_bad18, guard=guard18)
     R.results[-1].seconds = time.time() - t0
 
     return R
