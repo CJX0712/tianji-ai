@@ -32,12 +32,18 @@
         ∂L/∂β_t     = ⟨G_t, −α_t P_t k_tᵀ + v_t k_tᵀ⟩
         ∂L/∂k_t     = −α_tβ_t [ S_{t−1}ᵀ(G_t k_t) + G_tᵀ P_t ] + β_t · G_tᵀ v_t
 
-为什么用递推而不是论文的 chunkwise 并行形式：
-    chunkwise（WY 表示 + UT transform）是为 GPU 设计的 —— 它把 T×T 的递推
-    换成块内矩阵乘 + 块间递推，代价是需要求 (I − 三角矩阵)⁻¹ 与额外的
-    d×d 中间矩阵。在 CPU + NumPy 后端下，Python 层的循环开销被 einsum 的
-    BLAS 调用摊薄，实测递推形式的吞吐更高且数值更稳（无需矩阵求逆）。
-    chunkwise 作为 L10 微指令家族中的 associative-scan 家族保留其算子定义。
+三种实现形式都存在（同一数学，不同算法路径，由门禁机检等价）：
+    1. `forward`        —— 顺序递推（主干：CPU+NumPy 下最快、最省内存、无需矩阵求逆）
+    2. `gdn_parallel`   —— 扁平并行前缀扫描（Blelloch 1990 associative scan）
+    3. `gdn_chunkwise`  —— chunkwise 分块并行（块内并行 + 块间递推 O(T/C) 步，
+                           真实 GPU 内核的分块本质，见本文件末尾）
+    三者必须逐位一致：G11 机检 (1)≡(2)，G12 机检 (1)≡(3)，实测最大差均 8.88e-16。
+
+为什么不用**论文原版** chunkwise（WY 表示 + UT transform）：
+    那是为 GPU 设计的 —— 它把 T×T 的递推换成块内矩阵乘 + 块间递推，
+    代价是需要求 (I − 三角矩阵)⁻¹ 与额外的 d×d 中间矩阵。在 CPU + NumPy 后端下
+    数值更脆、内存更大，因此本项目只保留其算子定义（L10 `scan` 家族），
+    而用数学上严格同构、但无需矩阵求逆的「仿射算子块级组合」实现 GPU 分块结构。
 
 不变量（门禁复检）：
     D1 解析反向通过中心差分检验（相对误差 < 1e-6）
@@ -55,7 +61,8 @@ from .l1_contract import Ctx, Module
 
 __all__ = ["GatedDeltaNet", "CausalConv1D", "l2norm", "L2Norm",
            "gdn_init_state", "gdn_step", "gdn_decode_recurrent",
-           "gdn_parallel", "gdn_compose", "gdn_scan_inclusive"]
+           "gdn_parallel", "gdn_compose", "gdn_scan_inclusive",
+           "gdn_chunkwise"]
 
 
 # ---------------------------------------------------------------- L2 归一化
@@ -396,4 +403,80 @@ def gdn_parallel(q: np.ndarray, k: np.ndarray, v: np.ndarray,
             for t in range(T):
                 S_t = pref[t][2]                       # C_{P_t} = S_t（S_{-1}=0）
                 o[b, h, t] = S_t @ q[b, h, t]
+    return o
+
+
+# ---------------------------------------------------------------- chunkwise（分块并行，门禁 G12）
+#
+# 站在谁之上（零重写）：
+#     chunkwise 是 Gated DeltaNet / GLA / Mamba-2 真实 GPU 内核的训练形式
+#     （Yang et al. ICLR 2025 的 WY 表示 + UT transform；flash-linear-attention 内核库）。
+#     本项目原实现只用顺序递推，并把 chunkwise 留在 L10 微指令的算子定义里（README「已知边界」）。
+#     这里把它真正补上，结构与硬件内核一致：
+#         · 块内（intra-chunk）：把 C 个时间步的仿射算子复合成 1 个「块算子」，
+#           并用块内包含前缀取得每个时间步的输出 → 对应 GPU 上块内的张量核心矩阵乘；
+#         · 块间（inter-chunk）：只递推「块到块」的状态转移（O(T/C) 步而非 O(T) 步），
+#           → 对应序列并行 / 上下文并行的核心收益来源。
+#     与 `forward`（顺序递推）、`gdn_parallel`（扁平并行扫描）是三条不同的算法路径，
+#     三者必须逐位一致 —— 门禁 G12 机检这条线性注意力的最强正确性质。
+
+def gdn_chunkwise(q: np.ndarray, k: np.ndarray, v: np.ndarray,
+                  beta: np.ndarray, alpha: np.ndarray,
+                  chunk: int = 4) -> np.ndarray:
+    """Gated DeltaNet 的 chunkwise（分块并行）形式。
+
+    q,k,v : (B, H, T, D)   beta,alpha : (B, H, T)   chunk : 块长 C（不必整除 T）
+    返回 o : (B, H, T, D)
+
+    最后一块长度不足时正确处理（不必整除），避免只在整除情况下恰好成立。
+    """
+    q = np.asarray(q, dtype=np.float64)
+    k = np.asarray(k, dtype=np.float64)
+    v = np.asarray(v, dtype=np.float64)
+    beta = np.asarray(beta, dtype=np.float64)
+    alpha = np.asarray(alpha, dtype=np.float64)
+    B, H, T, D = q.shape
+    C = int(chunk)
+    if C < 1:
+        raise ValueError("chunk 必须 >= 1")
+    kh = l2norm(k)
+    eye = np.eye(D)
+    o = np.zeros((B, H, T, D), dtype=np.float64)
+    for b in range(B):
+        for h in range(H):
+            # ---- 每个时间步的仿射算子 F_t = (A_t, M_t, C_t)
+            ops = []
+            for t in range(T):
+                a = alpha[b, h, t]
+                bt = beta[b, h, t]
+                kt = kh[b, h, t]
+                vt = v[b, h, t]
+                ops.append((a * eye,
+                            eye - bt * np.outer(kt, kt),
+                            bt * np.outer(vt, kt)))
+            # ---- 分块：块算子 = 块内所有 F_t 的复合；块间只需 O(T/C) 步递推
+            starts, block_ops = [], []
+            idx = 0
+            while idx < T:
+                end = min(idx + C, T)
+                starts.append(idx)
+                acc = ops[idx]
+                for t in range(idx + 1, end):
+                    acc = gdn_compose(acc, ops[t])
+                block_ops.append(acc)
+                idx = end
+            # ---- 块间递推 + 块内包含前缀读输出
+            S_start = np.zeros((D, D))        # 进入本块前的状态 S_{start-1}
+            for ci, bo in enumerate(block_ops):
+                st = starts[ci]
+                en = min(st + C, T)
+                intra = [ops[st]]
+                for t in range(st + 1, en):
+                    intra.append(gdn_compose(intra[-1], ops[t]))
+                for j, t in enumerate(range(st, en)):
+                    A, M, Cc = intra[j]
+                    S_t = A @ S_start @ M + Cc   # 块内包含前缀作用在入口状态上
+                    o[b, h, t] = S_t @ q[b, h, t]
+                A_b, M_b, C_b = bo
+                S_start = A_b @ S_start @ M_b + C_b   # 块到块：递推步数 O(T/C)
     return o

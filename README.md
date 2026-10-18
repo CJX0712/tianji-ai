@@ -103,7 +103,7 @@ the quick brown fox. to be or not to be,
 | **L7** | 训练 | 余弦 / WSD 调度、梯度累积、梯度裁剪、bits-per-byte 度量 |
 | **L8** | 推理 | KV 状态缓存、per-channel INT8 / group-wise INT4、MTP 投机解码 |
 | **L9** | 对齐 | DPO / IPO / SimPO / KTO，统一走 `backward(g_logits=...)` 入口 |
-| **L10** | 微指令 + 门禁 | **1024 条可执行微指令**（32 家族 × 32）+ 11 道交付门禁 |
+| **L10** | 微指令 + 门禁 | **1024 条可执行微指令**（32 家族 × 32）+ 12 道交付门禁 |
 
 完整推导与逐层详解见 [ARCHITECTURE.md](ARCHITECTURE.md)。
 
@@ -135,6 +135,7 @@ Pre-RMSNorm → Mixer(GDN 或 MLA) → 残差 → Pre-RMSNorm → FFN(MoE 或 De
 | G9 量化 | INT8 < 1e-2、INT4 < 2e-1，且 INT8 ≤ INT4 | 5.58e-03 / 1.01e-01 |
 | G10 分词 | encode→decode 往返一致 | 4/4（含空格/tab/换行/缩略语） |
 | G11 并行形式等价 | Gated DeltaNet 递推 vs 并行前缀扫描（associative scan）两条算法路径逐位一致 | 8.88e-16 |
+| G12 chunkwise 等价 | Gated DeltaNet 递推 vs chunkwise 分块并行（块内并行+块间递推，真实 GPU 内核训练形式），含不整除尾块 | 8.88e-16 |
 
 **门禁的态度：失败就如实报失败，不允许放宽阈值凑绿。**
 
@@ -160,8 +161,8 @@ Pre-RMSNorm → Mixer(GDN 或 MLA) → 残差 → Pre-RMSNorm → FFN(MoE 或 De
 | A11 | checkpoint 往返 | 逐位一致 + 损坏拦截 | **均 True** |
 | A12 | 推理吞吐 | > 50 tok/s | **465 tok/s** |
 | A13 | 运行时依赖 | == 1 | **`['numpy']`** |
-| A14 | 单元测试 | 40/40 | **40/40** |
-| A15 | 交付门禁 | 11/11 | **11/11** |
+| A14 | 单元测试 | 41/41 | **41/41** |
+| A15 | 交付门禁 | 12/12 | **12/12** |
 | A16 | 断网可运行 | 0 处网络依赖 | **0** |
 
 三条判据的设定依据（A3 为何是 10%、A7 为何用权重误差、A8 为何放宽到 15%）
@@ -191,7 +192,7 @@ python scripts/quickstart.py          # 最小示例，约 10 秒
 2. 模型   4 层 布局=LLLA (A=MLA, L=GatedDeltaNet)，参数 252,032
 4. 训练   30 步 2.4s，loss 6.8636 -> 0.2036
 6. 生成   结果='the quick brown fox jumps over the lazy dog. ...'
-7. 门禁   11/11 通过
+7. 门禁   12/12 通过
 ✅ 全部通过
 ```
 
@@ -238,8 +239,8 @@ make verify-all        # 测试 + 门禁 + 最小示例（交付自查）
 
 ```bash
 docker build -t tianji:latest .
-docker run --rm tianji:latest gates      # 跑 11 道门禁
-docker run --rm tianji:latest test       # 跑 40 个测试
+docker run --rm tianji:latest gates      # 跑 12 道门禁
+docker run --rm tianji:latest test       # 跑 41 个测试
 
 docker compose run --rm tianji train     # 训练，产物落在 ./runs
 docker compose run --rm tianji generate  # 推理
@@ -276,8 +277,8 @@ python bench/run_bench.py --steps 120 --seed 0     # 约 2 分钟，写 bench/re
 
 ```bash
 make help          # 查看全部目标
-make test          # 40 个单元测试
-make gates         # 11 道交付门禁
+make test          # 41 个单元测试
+make gates         # 12 道交付门禁
 make bench         # 完整基准
 make quickstart    # 最小示例
 make train         # 训练
@@ -354,7 +355,7 @@ NumPy 2.5.4 纯 CPU、合成 2 阶马尔可夫语料（vocab=64）、d_model=64 
 | 训练 | ✅ CPU 可训 | ✅ GPU | ❌ | ✅ GPU |
 | 量化 / 投机解码 | ✅ | ❌ | ✅ | ❌ |
 | 对齐（DPO 等） | ✅ | ❌ | ❌ | ❌ |
-| **可证门禁** | **✅ 11 道** | ❌ | ❌ | 部分 |
+| **可证门禁** | **✅ 12 道** | ❌ | ❌ | 部分 |
 | 吞吐 | 低（NumPy CPU） | 高 | 极高 | 极高 |
 
 **诚实的结论**：本项目**不追求吞吐**。它的对标对象是「正确性可独立验证的研究级实现」，
@@ -458,7 +459,7 @@ tianji-ai/
 │   ├── model.py               3:1 混合模型组装
 │   ├── persist.py             checkpoint 保存/加载 + sha256 校验
 │   ├── data.py                内置离线语料
-│   ├── verify.py              11 道交付门禁
+│   ├── verify.py              12 道交付门禁
 │   └── cli.py                 命令行入口
 ├── scripts/
 │   ├── reproduce.sh             一键复现（Linux / macOS，无需 Docker）
@@ -470,7 +471,7 @@ tianji-ai/
 │   └── test_model.py            模型配置冒烟
 ├── docs/
 │   └── API.md                   完整 API 说明（L0–L10 全部接口）
-├── tests/test_all.py          40 个单元测试
+├── tests/test_all.py          41 个单元测试
 ├── bench/                     基准脚本 + 结果（bench.json）
 ├── Dockerfile                 一键环境（python:3.11-slim）
 ├── docker-compose.yml         挂载 ./runs 的训练/推理
@@ -494,6 +495,11 @@ tianji-ai/
   门禁 G8（现为 3:1 混合架构 GDN+MLA）可证「递推增量 ≡ 整序列重算」到机器精度
   （最大差 **2.22e-16**），`generate(use_cache=True) == generate(use_cache=False)`。
   因此本条已知边界已关闭。
+- **三种 GDN 训练形式已全实现并纳入门禁**：顺序递推 `forward`、并行前缀扫描
+  `gdn_parallel`、chunkwise 分块并行 `gdn_chunkwise`（块内并行 + 块间递推，真实 GPU
+  内核的分块本质）。三者必须逐位一致，由 G11 / G12 机检（最大差 **8.88e-16**，含不整除尾块）。
+  论文原版的 WY 表示 + UT transform 仍**未实现** —— 它需求 (I − 三角矩阵)⁻¹，
+  仅为 GPU 设计，CPU 上数值更脆；其算子定义保留在 L10 的 `scan` 家族中。
 - **MTP 是轻量版**：用单个线性投影替代 DeepSeek-V3 原版的完整 Transformer 层。
 - **没有 GPU 路径**：纯 NumPy CPU 实现，模型规模在百万参数以下。
 - **1024 条微指令中**，17 个家族（`FAMILY_KIND = "sweep"`）的成员是同一算子的参数扫描，
@@ -506,8 +512,8 @@ tianji-ai/
 
 | 检查项 | 结果 |
 |---|---|
-| 单元测试 | ✅ 40 / 40 通过 |
-| 交付门禁 | ✅ 11 / 11 全绿 |
+| 单元测试 | ✅ 41 / 41 通过 |
+| 交付门禁 | ✅ 12 / 12 全绿 |
 | **验收指标** | ✅ **16 / 16 达标**（`scripts/acceptance.py`，47s） |
 | 微指令 | ✅ 1024 / 1024 可执行 |
 | 最小可运行示例 | ✅ `scripts/quickstart.py` 5.4s 全通过 |

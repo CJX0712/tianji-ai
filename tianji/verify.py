@@ -19,6 +19,8 @@
     G10 分词往返      decode(encode(s)) == s
     G11 并行形式等价  Gated DeltaNet 递推（forward）vs 并行前缀扫描（associative scan）
                     两条不同算法路径逐位一致（线性注意力决定性正确性质）
+    G12 chunkwise 等价 Gated DeltaNet 递推 vs chunkwise 分块并行（块内并行 + 块间递推，
+                    真实 GPU 内核训练形式）；含不被整除的尾块，块长扫描
 """
 
 from __future__ import annotations
@@ -300,7 +302,7 @@ def run_all_gates(seed: int = 0, steps: int = 60, verbose: bool = True) -> GateR
     # 这是 Gated DeltaNet / GLA / Mamba-2 硬件内核正确性的核心证明：同一数学，
     # 两条不同算法路径（串行递推 vs 可并行前缀和）必须收敛到同一浮点结果。
     t0 = time.time()
-    from .l4_deltanet import GatedDeltaNet, gdn_parallel
+    from .l4_deltanet import GatedDeltaNet, gdn_parallel, gdn_chunkwise
     from .l1_contract import Ctx as _Ctx
     gs = rng(spawn_seed(seed, "g11"))
     Dg = 8
@@ -314,6 +316,28 @@ def run_all_gates(seed: int = 0, steps: int = 60, verbose: bool = True) -> GateR
     dg = float(np.max(np.abs(rec - par)))
     add("并行形式等价", dg < 1e-9,
         f"Gated DeltaNet 递推 vs 并行前缀扫描 最大差 {dg:.2e}", diff=dg)
+    R.results[-1].seconds = time.time() - t0
+
+    # ---------------------------------------------------------- G12 chunkwise 等价
+    # 递推（顺序循环）vs chunkwise（块内并行 + 块间递推，真实 GPU 内核训练形式）。
+    # T=23 故意不被块长整除，覆盖尾块长度不足的路径；块长扫描覆盖多种 tiling。
+    t0 = time.time()
+    gs = rng(spawn_seed(seed, "g12"))
+    Dg = 8
+    Tg = 23
+    qg = gs.standard_normal((2, 2, Tg, Dg))
+    kg = gs.standard_normal((2, 2, Tg, Dg))
+    vg = gs.standard_normal((2, 2, Tg, Dg))
+    bg = gs.random((2, 2, Tg))
+    ag = gs.random((2, 2, Tg))
+    rec12 = GatedDeltaNet().forward(_Ctx(), qg, kg, vg, bg, ag)
+    worst = 0.0
+    for ch in (1, 2, 3, 4, 8, 16):
+        cw = gdn_chunkwise(qg, kg, vg, bg, ag, chunk=ch)
+        worst = max(worst, float(np.max(np.abs(rec12 - cw))))
+    add("chunkwise 等价", worst < 1e-9,
+        f"Gated DeltaNet 递推 vs chunkwise（T={Tg}, 6 种块长含不整除尾块）最大差 {worst:.2e}",
+        diff=worst)
     R.results[-1].seconds = time.time() - t0
 
     return R

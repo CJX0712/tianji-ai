@@ -18,7 +18,7 @@ from tianji.l3_primitives import (                          # noqa: E402
     Linear, RMSNorm, RoPE, SwiGLU, CausalAttention, CrossEntropy,
     rope_tables, causal_mask_rect, causal_mask)
 from tianji.l4_deltanet import (        # noqa: E402
-    GatedDeltaNet, CausalConv1D, L2Norm, gdn_parallel)
+    GatedDeltaNet, CausalConv1D, L2Norm, gdn_parallel, gdn_chunkwise)
 from tianji.l5_moe import (                                 # noqa: E402
     MoELayer, LoadBalancer, sigmoid)
 from tianji.l6_optimizer import Muon, Muon2, orthogonalization_quality  # noqa: E402
@@ -227,6 +227,21 @@ def test_gdn_parallel_equals_recurrent():
     rec = GatedDeltaNet().forward(Ctx(), q, k, v, beta, alpha)
     par = gdn_parallel(q, k, v, beta, alpha)
     assert np.allclose(rec, par, atol=1e-9)
+
+
+def test_gdn_chunkwise_equals_recurrent():
+    """chunkwise（分块并行）形式 vs 递推形式逐位一致（门禁 G12 的单元级复检）。
+
+    T=11 故意不被 chunk 整除，覆盖尾块长度不足的路径 —— 只在整除时成立的实现会在这里暴露。
+    """
+    g = rng(121)
+    B, H, T, D = 2, 3, 11, 6
+    q, k, v = (g.standard_normal((B, H, T, D)) for _ in range(3))
+    beta, alpha = g.random((B, H, T)), g.random((B, H, T))
+    rec = GatedDeltaNet().forward(Ctx(), q, k, v, beta, alpha)
+    for chunk in (1, 2, 4, 5, 16):
+        assert np.allclose(rec, gdn_chunkwise(q, k, v, beta, alpha, chunk=chunk),
+                           atol=1e-9), f"chunk={chunk} 不等价"
 
 
 def test_gdn_state_bounded():
