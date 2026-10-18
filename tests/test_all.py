@@ -519,6 +519,44 @@ def test_reference_model_frozen():
     assert set(G.keys()) <= set(P.keys())
 
 
+def test_dpo_end_to_end_gradcheck_and_direction():
+    """G16 核心：DPO 全链路（chosen+rejected 双向反传+梯度合并）的参数梯度
+    用中心差分独立裁判；一步更新后 chosen logprob 上升、rejected 下降。"""
+    from tianji.l9_align import Aligner, freeze_copy, seq_logprob
+    cfg = TianjiConfig(vocab_size=24, d_model=16, n_layers=2, n_heads=2,
+                       n_kv_heads=1, d_latent_q=8, d_latent_kv=6, d_rope=4,
+                       d_ff=16, d_ff_expert=12, n_experts=2, moe_top_k=1,
+                       max_len=32, mtp_depth=0)
+    g = rng(77)
+    P = init_params(cfg, seed=3)
+    pol = TianjiModel(cfg, P)
+    al = Aligner(pol, freeze_copy(init_params(cfg, seed=9)), method="dpo", beta=0.1)
+    xc, yc = g.integers(0, 24, (1, 6)), g.integers(0, 24, (1, 6))
+    xr, yr = g.integers(0, 24, (1, 5)), g.integers(0, 24, (1, 5))
+    _, G = al.loss_and_grads(xc, yc, xr, yr)
+
+    eps = 1e-5
+    for k in ("tok_emb", "final_norm_w"):
+        arr = P[k]
+        idx = tuple(0 for _ in arr.shape)
+        o = arr[idx]
+        arr[idx] = o + eps; fp = al.loss_and_grads(xc, yc, xr, yr)[0]
+        arr[idx] = o - eps; fm = al.loss_and_grads(xc, yc, xr, yr)[0]
+        arr[idx] = o
+        num = (fp - fm) / (2 * eps)
+        assert abs(num - G[k][idx]) < 1e-6, f"{k} 端到端梯度失配: {num} vs {G[k][idx]}"
+
+    lp_c0 = seq_logprob(pol.forward(xc, yc)["logits"], yc)
+    lp_r0 = seq_logprob(pol.forward(xr, yr)["logits"], yr)
+    for k in P:
+        if k in G:
+            P[k] -= 0.5 * G[k]
+    lp_c1 = seq_logprob(pol.forward(xc, yc)["logits"], yc)
+    lp_r1 = seq_logprob(pol.forward(xr, yr)["logits"], yr)
+    assert lp_c1 > lp_c0, "chosen logprob 应上升"
+    assert lp_r1 < lp_r0, "rejected logprob 应下降"
+
+
 # ============================================================ L10 微指令
 
 def test_microop_count():

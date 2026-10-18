@@ -35,6 +35,17 @@
                     的位置对齐 off-by-one 与 draft 状态快照回滚）；(b) 代数条件：
                     每轮主干 forward 恰 1 次、tokens/forward > 1（全接受 γ+1）；
                     (c) 混合接受/拒绝统计无损（TV）+ 接受率 ∈ (0,1)
+    G16 对齐正确性     DPO/IPO/SimPO/KTO 的解析与全链路性质（A1-A5 全部首次机检）：
+                    (a) 解析值 —— DPO/KTO 在 Δ=0 时 loss==log2、系数符号正确，
+                    IPO 在最优 Δ*=τ/(2β) 处系数==0（有限目标，DPO 病态的修复）；
+                    (b) grad_logprob 中心差分独立裁判（含 pad mask）；
+                    (c) DPO 端到端参数梯度中心差分（真实小模型，chosen/rejected
+                    双向反传 + 梯度合并全链路）；
+                    (d) 梯度方向与偏好一致 —— 一步更新后 chosen logprob 上升、
+                    rejected 下降（DPO 的灵魂）；
+                    (e) SimPO 长度归一化 —— 序列复制两倍长平均 logprob 逐位不变；
+                    (f) 参考模型冻结 —— loss_and_grads 前后 ref 参数零漂移，
+                    freeze_copy 为独立数组（DPO 最隐蔽的失效模式）
 """
 
 from __future__ import annotations
@@ -531,6 +542,107 @@ def run_all_gates(seed: int = 0, steps: int = 60, verbose: bool = True) -> GateR
         f"混合路径 4000 token TV={tvc:.4f}；接受率 {stc.accept_rate:.3f}∈(0,1)",
         fingerprint=pos_ok, calls=m15.calls, tv=tvc,
         accept_rate=stc.accept_rate)
+    R.results[-1].seconds = time.time() - t0
+
+    # ---------------------------------------------------------- G16 对齐正确性
+    t0 = time.time()
+    from .l9_align import (Aligner, dpo_terms, ipo_terms, kto_terms,
+                           seq_logprob, mean_logprob, grad_logprob, freeze_copy)
+    from .l0_numerics import log_softmax as _lsm
+    g16 = rng(spawn_seed(seed, "align"))
+
+    # ---- (a) 解析值：中性损失与系数符号
+    l16, c16 = dpo_terms(0., 0., 0., 0., beta=0.1)
+    lz16, _ = kto_terms(0., 0., True)
+    lb16, _ = kto_terms(0., 0., False)
+    dstar = 0.1 / (2 * 0.1)                       # IPO 最优 Δ* = τ/(2β)
+    _, ci16 = ipo_terms(dstar, 0., 0., 0., beta=0.1, tau=0.1)
+    lipo_big, _ = ipo_terms(50., 0., 0., 0., beta=0.1)
+    ldpo_big, _ = dpo_terms(50., 0., 0., 0., beta=0.1)
+    analytic_ok = (abs(l16 - np.log(2)) < 1e-9 and abs(c16 + 0.05) < 1e-12
+                   and abs(lz16 - np.log(2)) < 1e-9 and abs(lb16 - np.log(2)) < 1e-9
+                   and ci16 == 0.0 and lipo_big > 100.0 and ldpo_big < 0.01)
+
+    # ---- (b) grad_logprob 中心差分（logits 空间独立裁判，含 pad mask）
+    V16, T16 = 12, 5
+    lg16 = g16.standard_normal((2, T16, V16))
+    tg16 = g16.integers(0, V16, size=(2, T16))
+    tg16[0, 2] = -1                               # pad 位置必须被 mask
+    Ga16 = grad_logprob(lg16, tg16)
+    eps16 = 1e-6
+
+    def _f16(z):
+        lp = _lsm(z, axis=-1)
+        sel = np.where(tg16 >= 0)
+        return float(np.sum(lp[sel[0], sel[1], tg16[tg16 >= 0]]))
+
+    worst16 = 0.0
+    for bi, ti, vi in [(0, 0, 3), (0, 1, 5), (0, 2, 7), (1, 3, 1), (1, 2, 9)]:
+        o = lg16[bi, ti, vi]
+        lg16[bi, ti, vi] = o + eps16; fp = _f16(lg16)
+        lg16[bi, ti, vi] = o - eps16; fm = _f16(lg16)
+        lg16[bi, ti, vi] = o
+        worst16 = max(worst16, abs((fp - fm) / (2 * eps16) - Ga16[bi, ti, vi]))
+
+    # ---- (c)+(d)+(f) 真实小模型：端到端参数梯度中心差分 + 梯度方向 + ref 冻结
+    from .model import TianjiConfig, init_params
+    cfg16 = TianjiConfig(vocab_size=24, d_model=16, n_layers=2, n_heads=2,
+                         n_kv_heads=1, d_latent_q=8, d_latent_kv=6, d_rope=4,
+                         d_ff=16, d_ff_expert=12, n_experts=2, moe_top_k=1,
+                         max_len=32, mtp_depth=0)
+    P16 = init_params(cfg16, seed=seed + 3)
+    Pref16 = freeze_copy(init_params(cfg16, seed=seed + 9))
+    pol16 = TianjiModel(cfg16, P16)
+    al16 = Aligner(pol16, Pref16, method="dpo", beta=0.1)
+    xc = g16.integers(0, 24, size=(1, 6)); yc = g16.integers(0, 24, size=(1, 6))
+    xr = g16.integers(0, 24, size=(1, 5)); yr = g16.integers(0, 24, size=(1, 5))
+    _, G16 = al16.loss_and_grads(xc, yc, xr, yr)
+    ref_before16 = {k: v.copy() for k, v in al16.ref_model.P.items()}
+
+    e2e16 = 0.0
+    for k in ("tok_emb", "final_norm_w", "L1.Wg"):
+        if k not in P16:
+            continue
+        arr = P16[k]
+        idx = tuple(0 for _ in arr.shape)
+        o = arr[idx]
+        arr[idx] = o + eps16; fp = al16.loss_and_grads(xc, yc, xr, yr)[0]
+        arr[idx] = o - eps16; fm = al16.loss_and_grads(xc, yc, xr, yr)[0]
+        arr[idx] = o
+        e2e16 = max(e2e16, abs((fp - fm) / (2 * eps16) - G16[k][idx]))
+
+    out_c0 = pol16.forward(xc, yc); lp_c0 = seq_logprob(out_c0["logits"], yc)
+    out_r0 = pol16.forward(xr, yr); lp_r0 = seq_logprob(out_r0["logits"], yr)
+    for k in P16:
+        if k in G16:
+            P16[k] -= 0.5 * G16[k]
+    out_c1 = pol16.forward(xc, yc); lp_c1 = seq_logprob(out_c1["logits"], yc)
+    out_r1 = pol16.forward(xr, yr); lp_r1 = seq_logprob(out_r1["logits"], yr)
+    dir_ok = lp_c1 > lp_c0 and lp_r1 < lp_r0
+
+    al16.loss_and_grads(xc, yc, xr, yr)          # 再跑两步，ref 必须零漂移
+    al16.loss_and_grads(xc, yc, xr, yr)
+    drift16 = max(float(np.max(np.abs(al16.ref_model.P[k] - ref_before16[k])))
+                  for k in ref_before16)
+    frozen_ok = drift16 == 0.0 and all(Pref16[k] is not P16[k] for k in Pref16)
+
+    # ---- (e) SimPO 长度归一化：复制两倍长逐位不变
+    slg = g16.standard_normal((1, T16, V16))
+    stg = g16.integers(0, V16, size=(1, T16))
+    mp1 = mean_logprob(slg, stg)
+    mp2 = mean_logprob(np.concatenate([slg, slg], axis=1),
+                       np.concatenate([stg, stg], axis=1))
+    simpo_ok = mp1 == mp2
+
+    ok16 = analytic_ok and worst16 < 1e-6 and e2e16 < 1e-6 and dir_ok \
+        and frozen_ok and simpo_ok
+    add("对齐正确性", ok16,
+        f"解析值（DPO/KTO Δ=0→log2、IPO Δ* 系数=0、Δ=50: DPO={ldpo_big:.1e} vs "
+        f"IPO={lipo_big:.0f}）；grad_logprob 中心差分 {worst16:.2e}；"
+        f"DPO 端到端参数梯度 {e2e16:.2e}；方向 chosen{'↑' if dir_ok else '✗'}"
+        f"/rejected{'↓' if dir_ok else '✗'}；ref 漂移 {drift16:.1e}；"
+        f"SimPO 长度不变={simpo_ok}",
+        analytic=worst16, e2e=e2e16, ref_drift=drift16)
     R.results[-1].seconds = time.time() - t0
 
     return R

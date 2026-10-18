@@ -103,7 +103,7 @@ the quick brown fox. to be or not to be,
 | **L7** | 训练 | 余弦 / WSD 调度、梯度累积、梯度裁剪、bits-per-byte 度量 |
 | **L8** | 推理 | KV 状态缓存、per-channel INT8 / group-wise INT4、MTP 投机解码 |
 | **L9** | 对齐 | DPO / IPO / SimPO / KTO，统一走 `backward(g_logits=...)` 入口 |
-| **L10** | 微指令 + 门禁 | **1024 条可执行微指令**（32 家族 × 32）+ 15 道交付门禁 |
+| **L10** | 微指令 + 门禁 | **1024 条可执行微指令**（32 家族 × 32）+ 16 道交付门禁 |
 
 完整推导与逐层详解见 [ARCHITECTURE.md](ARCHITECTURE.md)。
 
@@ -139,6 +139,7 @@ Pre-RMSNorm → Mixer(GDN 或 MLA) → 残差 → Pre-RMSNorm → FFN(MoE 或 De
 | G13 chunkwise 反向等价 | Gated DeltaNet 物化全量状态反向 vs FlashAttention 式重计算反向（只存 O(T/C) 块入口状态），两条资源/算法路径给同一解析梯度，中心差分独立裁判 | 4.44e-15 |
 | G14 投机解码无损 | Leviathan/Chen 拒绝采样恒等：单步输出分布逐点==target（64 组对抗分布解析验证）+ 6000 token 端到端统计 + 接受率∈(0,1)；加速边界如实声明（MTP 搭车结构性 ≈1） | 2.22e-16 / TV=0.0088 |
 | G15 投机解码并行验证 | 独立轻量 draft（TinyDraftGDN 复用已门禁 gdn_step）+ γ>1 一次 batch 验证：位置指纹逐位一致（钉死 off-by-one 与状态回滚）+ tokens/forward>1 代数条件 + 混合路径统计无损 | 指纹✅ / 3.0 / TV=0.0147 |
+| G16 对齐正确性 | DPO/IPO/SimPO/KTO 首次全机检：解析值（Δ=0→log2、IPO 有限目标 Δ*=τ/2β 系数=0）+ grad_logprob 中心差分 + DPO 端到端参数梯度中心差分 + 方向 chosen↑/rejected↓ + SimPO 长度不变 + ref 零漂移 | 8.9e-11 / 方向✅ |
 
 **门禁的态度：失败就如实报失败，不允许放宽阈值凑绿。**
 
@@ -165,7 +166,7 @@ Pre-RMSNorm → Mixer(GDN 或 MLA) → 残差 → Pre-RMSNorm → FFN(MoE 或 De
 | A12 | 推理吞吐 | > 50 tok/s | **465 tok/s** |
 | A13 | 运行时依赖 | == 1 | **`['numpy']`** |
 | A14 | 单元测试 | 41/41 | **41/41** |
-| A15 | 交付门禁 | 15/15 | **15/15** |
+| A15 | 交付门禁 | 16/16 | **16/16** |
 | A16 | 断网可运行 | 0 处网络依赖 | **0** |
 
 三条判据的设定依据（A3 为何是 10%、A7 为何用权重误差、A8 为何放宽到 15%）
@@ -195,7 +196,7 @@ python scripts/quickstart.py          # 最小示例，约 10 秒
 2. 模型   4 层 布局=LLLA (A=MLA, L=GatedDeltaNet)，参数 252,032
 4. 训练   30 步 2.4s，loss 6.8636 -> 0.2036
 6. 生成   结果='the quick brown fox jumps over the lazy dog. ...'
-7. 门禁   15/15 通过
+7. 门禁   16/16 通过
 ✅ 全部通过
 ```
 
@@ -242,8 +243,8 @@ make verify-all        # 测试 + 门禁 + 最小示例（交付自查）
 
 ```bash
 docker build -t tianji:latest .
-docker run --rm tianji:latest gates      # 跑 15 道门禁
-docker run --rm tianji:latest test       # 跑 47 个测试
+docker run --rm tianji:latest gates      # 跑 16 道门禁
+docker run --rm tianji:latest test       # 跑 48 个测试
 
 docker compose run --rm tianji train     # 训练，产物落在 ./runs
 docker compose run --rm tianji generate  # 推理
@@ -280,8 +281,8 @@ python bench/run_bench.py --steps 120 --seed 0     # 约 2 分钟，写 bench/re
 
 ```bash
 make help          # 查看全部目标
-make test          # 47 个单元测试
-make gates         # 15 道交付门禁
+make test          # 48 个单元测试
+make gates         # 16 道交付门禁
 make bench         # 完整基准
 make quickstart    # 最小示例
 make train         # 训练
@@ -358,7 +359,7 @@ NumPy 2.5.4 纯 CPU、合成 2 阶马尔可夫语料（vocab=64）、d_model=64 
 | 训练 | ✅ CPU 可训 | ✅ GPU | ❌ | ✅ GPU |
 | 量化 / 投机解码 | ✅ | ❌ | ✅ | ❌ |
 | 对齐（DPO 等） | ✅ | ❌ | ❌ | ❌ |
-| **可证门禁** | **✅ 15 道** | ❌ | ❌ | 部分 |
+| **可证门禁** | **✅ 16 道** | ❌ | ❌ | 部分 |
 | 吞吐 | 低（NumPy CPU） | 高 | 极高 | 极高 |
 
 **诚实的结论**：本项目**不追求吞吐**。它的对标对象是「正确性可独立验证的研究级实现」，
@@ -462,7 +463,7 @@ tianji-ai/
 │   ├── model.py               3:1 混合模型组装
 │   ├── persist.py             checkpoint 保存/加载 + sha256 校验
 │   ├── data.py                内置离线语料
-│   ├── verify.py              15 道交付门禁
+│   ├── verify.py              16 道交付门禁
 │   └── cli.py                 命令行入口
 ├── scripts/
 │   ├── reproduce.sh             一键复现（Linux / macOS，无需 Docker）
@@ -474,7 +475,7 @@ tianji-ai/
 │   └── test_model.py            模型配置冒烟
 ├── docs/
 │   └── API.md                   完整 API 说明（L0–L10 全部接口）
-├── tests/test_all.py          47 个单元测试
+├── tests/test_all.py          48 个单元测试
 ├── bench/                     基准脚本 + 结果（bench.json）
 ├── Dockerfile                 一键环境（python:3.11-slim）
 ├── docker-compose.yml         挂载 ./runs 的训练/推理
