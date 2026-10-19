@@ -149,10 +149,14 @@
                     证明「降到多少才算学会」的判据是被算出来的、不是编的；
                     (b) 损失不破熵下界 —— 未训练模型验证交叉熵 ≥ H（若 loss
                     算出 sub-entropy 值即说明损失函数有 bug，本护栏拦截）；
-                    (c) 基准诚实性 —— 读 bench/results/bench.json，断言各配置
-                    learned fraction = (uniform−loss)/(uniform−H) 全部 ≤ 1.0
-                    （即没有任何配置突破熵下界；当前基准均远未学会，见
-                    BENCHMARKS.md 诚实修订）
+                    (c) 基准诚实性 + 判别力 —— 读 bench/results/bench.json：
+                    E3a 主基准各配置 learned fraction = (uniform−loss)/(uniform−H)
+                    全部 ≤ 1.0（没有任何配置突破熵下界；当前主基准均远未学会，
+                    见 BENCHMARKS.md 诚实修订）；E3b 可学性对照臂（B7，1 阶
+                    vocab=8 同源语料、同模型规模）lf_full > 0.5 且模型全量 val
+                    与同一序列上的真实源 oracle 差 < 0.05 —— 证明基准不是
+                    「永远学不会」的钝器：任务在规模内可学时 lf 转正、模型逼近
+                    真实源，B1 的三架构比较在该臂上才有统计意义
     G25 全模型反向一致性 完整模型（GDN+MLA+MoE+MTP 装配）解析反向 vs 中心差分
                     （分层抽样：每张量少量均匀点 + 全局随机点，全参数中心差分
                     太慢 ≈190s）：G2 只校验各独立原语反向，本门禁补齐把它们装配成
@@ -1717,7 +1721,11 @@ def run_all_gates(seed: int = 0, steps: int = 60, verbose: bool = True) -> GateR
     vld0 = DataLoader(markov_tokens(1500, 64, 7), seq_len=32, batch_size=8, seed=999)
     ce0 = float(evaluate(m0, vld0, n_batch=12))
     guard_ok = bool(np.isfinite(ce0) and ce0 >= 0.0 and ce0 >= H - 1e-6)
-    # E3 · 基准诚实性：读 bench.json，断言各配置 learned fraction ≤ 1（不破熵下界）
+    # E3 · 基准诚实性 + 判别力（读 bench.json）：
+    #   E3a 主基准：各配置 learned fraction ≤ 1（不破熵下界）—— 诚实护栏
+    #   E3b 可学性对照臂（B7）：lf_full > 0.5 且模型全量 val ≈ 同序列 oracle
+    #       —— 判别力证明：任务在规模内可学时，lf 转正、模型逼近真实源，
+    #        「学不会」是主基准任务的数据稀缺而非基准/管线缺陷
     import json as _json, os as _os
     bj = _os.path.join(_os.path.dirname(__file__), "..", "bench", "results", "bench.json")
     if _os.path.exists(bj):
@@ -1735,22 +1743,46 @@ def run_all_gates(seed: int = 0, steps: int = 60, verbose: bool = True) -> GateR
                     rows.append((r.get("name", "?"), float(r["val_loss"]), _lf(r["val_loss"])))
         max_lf = max((x[2] for x in rows), default=0.0) if rows else 0.0
         over = any(x[2] > 1.0 + 1e-9 for x in rows)
-        honesty_detail = (f"读 bench.json：{len(rows)} 个配置的最大 learned fraction="
+        honesty_detail = (f"E3a 读 bench.json：{len(rows)} 个配置的最大 learned fraction="
                          f"{max_lf:.3f}（=(uniform−模型)/(uniform−floor)，1.0=达到熵下界）；"
                          f"全部 ≤ 1 即「没有任何配置突破熵下界」；当前基准均远未学会"
                          f"（见 BENCHMARKS.md）")
+        # E3b · 可学性对照臂（bench.json 的 "learnable" 段，由 B7 生成）
+        lv = bench.get("learnable")
+        if lv and lv.get("rows") and all(
+                "val_loss_full" in r and "oracle_nll_full" in r for r in lv["rows"]):
+            Hl, ul = float(lv["H"]), float(lv["uniform"])
+            lf_full = [(r.get("name", "?"), (ul - float(r["val_loss_full"])) / (ul - Hl))
+                       for r in lv["rows"]]
+            gaps = [(r.get("name", "?"), abs(float(r["val_loss_full"]) - float(r["oracle_nll_full"])))
+                    for r in lv["rows"]]
+            best_lf_name, best_lf = max(lf_full, key=lambda t: t[1])
+            gap_name, min_gap = min(gaps, key=lambda t: t[1])
+            arm_ok = bool(best_lf > 0.5 and min_gap < 0.05)
+            arm_best_lf, arm_min_gap = best_lf, min_gap
+            honesty_detail += (
+                f"；E3b 可学性对照臂（1 阶 vocab=8、同源、{lv.get('steps')} 步）："
+                f"最优 lf_full={best_lf:+.3f}（{best_lf_name}，>0.5 即真学会而非贴 uniform），"
+                f"模型全量 val 与同序列 oracle 最大差 {min_gap:.4f}<0.05（{gap_name}）"
+                f"—— 证明基准判别力：可学任务上 lf 转正、模型逼近真实源")
+        else:
+            arm_ok, arm_best_lf, arm_min_gap = True, 0.0, float("inf")
+            honesty_detail += ("；E3b bench.json 缺 learnable 段，跳过"
+                               "（运行 `python bench/run_bench.py` 后机检对照臂）")
     else:
         max_lf, over = 0.0, False
+        arm_ok, arm_best_lf, arm_min_gap = True, 0.0, float("inf")
         honesty_detail = ("bench/results/bench.json 不存在，跳过读取（门禁仍守着 H 自洽"
                          f"与不破下界）；运行 `python bench/run_bench.py` 后可机检 learned fraction")
-    ok24 = bool(er["consistent"] and guard_ok and not over)
+    ok24 = bool(er["consistent"] and guard_ok and not over and arm_ok)
     add("基准熵下界", ok24,
         f"E1 熵率自洽：H={H:.4f} nats（解析平稳分布 H_A={er['H_analytic']:.4f} 与 "
         f"oracle 交叉熵 H_B={er['H_oracle']:.4f} 差 {er['abs_diff']:.2e}<{er['tol']:.0e}），"
         f"0<H<log(vocab)={er['log_vocab']:.4f}；E2 损失不破下界：未训练模型验证 CE "
         f"{ce0:.4f} ≥ H（差 {ce0 - H:+.4f}，sub-entropy 即 bug，本护栏拦截）；E3 {honesty_detail}",
         H=H, H_A=float(er["H_analytic"]), H_B=float(er["H_oracle"]), diff=float(er["abs_diff"]),
-        ce0=ce0, max_learned_fraction=float(max_lf))
+        ce0=ce0, max_learned_fraction=float(max_lf),
+        learnable_best_lf=float(arm_best_lf), learnable_min_gap=float(arm_min_gap))
     R.results[-1].seconds = time.time() - t0
 
     # ---- G25 · 全模型反向一致性（端到端 gradcheck） ----

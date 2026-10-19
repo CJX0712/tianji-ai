@@ -10,6 +10,9 @@
     B4 量化    FP64 / INT8 / INT4 的困惑度退化
     B5 缓存    混合架构 vs 全注意力的 KV cache 字节数（随上下文长度）
     B6 投机解码 接受率与加速比
+    B7 可学性对照臂  同模型规模换「规模内可学」语料（1 阶 vocab=8），
+                     证明基准能测出「学会」（learned fraction 转正 ≈1），
+                     不是永远学不会的钝器；B1 的三架构在同一可学任务上重跑
 
 诚实声明：
     - 语料是**确定性合成**的 2 阶马尔可夫（:func:`tianji.markov_tokens`），不是真实文本。
@@ -40,7 +43,8 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from tianji.model import TianjiConfig, TianjiModel, init_params          # noqa: E402
 from tianji.data import (markov_tokens as synth_tokens,                  # noqa: E402
-                         markov_entropy_rate, markov_train_val)
+                         markov_entropy_rate, markov_train_val,
+                         markov_transitions)
 from tianji.l6_optimizer import HybridOptimizer, AdamW, Muon, Muon2       # noqa: E402
 from tianji.l7_train import DataLoader, Trainer, evaluate                 # noqa: E402
 from tianji.l8_infer import (quantize_per_channel, quantize_groupwise,    # noqa: E402
@@ -59,7 +63,7 @@ def base_cfg(**kw):
 
 
 def run_train(cfg, tok, val_tok, steps, seed, opt_kind="muon2", lr=0.03,
-              seq=32, batch=8):
+              seq=32, batch=8, full_val_batches=0, oracle_trans=None):
     P = init_params(cfg, seed=seed)
     m = TianjiModel(cfg, P)
     if opt_kind == "muon2":
@@ -79,7 +83,7 @@ def run_train(cfg, tok, val_tok, steps, seed, opt_kind="muon2", lr=0.03,
     t0 = time.time()
     log = tr.run(steps, verbose=False)
     dt = time.time() - t0
-    return {
+    r = {
         "params": m.param_count(),
         "layers": "".join("A" if l == "attn" else "L" for l in m.layers),
         "final_loss": float(np.mean(log.losses[-5:])),
@@ -89,6 +93,17 @@ def run_train(cfg, tok, val_tok, steps, seed, opt_kind="muon2", lr=0.03,
         "tokens_per_s": steps * batch * seq / max(dt, 1e-9),
         "ms_per_step": dt * 1000 / steps,
     }
+    # 可选的「全量 val + oracle 参照」（B7 对照臂用）：
+    # Trainer 的 val 只抽 4 个 batch（1024 token）—— 与 B1-B3 同协议、可比，
+    # 但小样本上 lf 有 ±0.05 量级波动；full_val_batches>0 时补一个覆盖几乎全部
+    # val 的低噪声数字，oracle_trans 给定则再报真实转移矩阵在同一 val 序列上的
+    # 交叉熵 —— 模型 vs oracle 的差距才是「学会了没有」的精确判据。
+    if full_val_batches:
+        r["val_loss_full"] = float(evaluate(m, vld, n_batch=full_val_batches))
+    if oracle_trans is not None:
+        a, b = val_tok[:-1], val_tok[1:]      # 一阶源：上一个 token 即全部上下文
+        r["oracle_nll_full"] = float(-np.log(oracle_trans[a, b] + 1e-300).mean())
+    return r
 
 
 def bench_architecture(steps, seed):
@@ -134,6 +149,52 @@ def bench_optimizer(steps, seed):
         print(f"  optimizer={kind:<8} lr={lr:<7} loss={r['final_loss']:.4f} "
               f"val={r['val_loss']:.4f}", flush=True)
     return rows
+
+
+def bench_learnable(steps, seed):
+    """B7 可学性对照臂 —— 证明基准不是「永远学不会」的钝器。
+
+    主基准（B1-B3）的 2 阶 vocab=64 任务在 6k token 规模下真实数据稀缺
+    （4096 个上下文状态 × 每状态仅 ~1.5 次观测），任何配置都学不会
+    （learned fraction 全负、全员贴在 uniform 基线）。这留下一个合理质疑：
+    「是架构学不会，还是基准本身就是钝器？」本臂用**同一模型规模、同一训练
+    协议、同一 seed**，只把语料换成规模内可学的 1 阶马尔可夫（vocab=8、
+    60k train / 15k val 同源留出，H=1.5533）：
+      - learned fraction 应转正到 ≈1（模型交叉熵逼近真实转移矩阵的 oracle 值）；
+      - 三架构配置在同一可学任务上的差异，才有统计意义（不再全员贴 uniform）。
+    步数取 600（探针实测 Hybrid 在 step≈60 即达 lf≈1.0，600 步确保三配置
+    均已收敛，比较的是容量而非优化速度）。
+    """
+    V, ORDER, N_TR, N_VA = 8, 1, 60_000, 15_000
+    tok, val = markov_train_val(N_TR, N_VA, V, seed, order=ORDER)
+    trans = markov_transitions(V, seed, ORDER)
+    er = markov_entropy_rate(vocab=V, seed=seed, order=ORDER)
+    H, uniform = float(er["H"]), float(er["log_vocab"])
+    n_full = N_VA // (8 * 32) + 2          # 覆盖几乎全部 val 的 batch 数
+    rows = []
+    variants = [
+        ("Hybrid 3:1 (GDN+MLA)", dict(hybrid_ratio=3)),
+        ("全注意力 (MLA)", dict(hybrid_ratio=0)),
+        ("全 GDN (无注意力)", dict(hybrid_ratio=10 ** 6)),
+    ]
+    for name, kw in variants:
+        cfg = base_cfg(vocab_size=V, **kw)
+        r = run_train(cfg, tok, val, steps, seed,
+                      full_val_batches=n_full, oracle_trans=trans)
+        r["name"] = name
+        r["learned_fraction"] = (uniform - r["val_loss"]) / (uniform - H)
+        r["learned_fraction_full"] = (uniform - r["val_loss_full"]) / (uniform - H)
+        rows.append(r)
+        print(f"  {name:<24} loss={r['final_loss']:.4f} "
+              f"val={r['val_loss']:.4f}(lf={r['learned_fraction']:+.3f}) "
+              f"full_val={r['val_loss_full']:.4f}"
+              f"(lf={r['learned_fraction_full']:+.3f}) "
+              f"oracle={r['oracle_nll_full']:.4f} H={H:.4f} "
+              f"{r['ms_per_step']:.0f}ms/step", flush=True)
+    return {"corpus": {"order": ORDER, "vocab": V, "n_train": N_TR,
+                       "n_val": N_VA, "same_source": True,
+                       "note": "markov_train_val 单源双采样（同源留出，门禁 G26 同款）"},
+            "H": H, "uniform": uniform, "steps": steps, "rows": rows}
 
 
 def bench_quantization(seed):
@@ -273,11 +334,17 @@ def main():
     print("=" * 68)
     b6 = bench_speculative(a.seed)
     print()
+    print("=" * 68)
+    print("B7 可学性对照臂（同规模模型 · 规模内可学语料）")
+    print("=" * 68)
+    b7 = bench_learnable(600, a.seed)
+    print()
 
     out = {"seed": a.seed, "steps": steps,
            "entropy": er,
            "architecture": b1, "layout": b2, "optimizer": b3,
            "quantization": b4, "cache": b5, "speculative": b6,
+           "learnable": b7,
            "timestamp": time.strftime("%Y-%m-%d %H:%M:%S")}
     os.makedirs(os.path.join(os.path.dirname(__file__), "results"), exist_ok=True)
     path = os.path.join(os.path.dirname(__file__), "results", "bench.json")

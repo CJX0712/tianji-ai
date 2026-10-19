@@ -147,7 +147,7 @@ Pre-RMSNorm → Mixer(GDN 或 MLA) → 残差 → Pre-RMSNorm → FFN(MoE 或 De
 | G21 数据管道 | D1-D4+T1 全机检 + 边界对抗：构造期响亮校验（曾抓出数据过短时 max(n,1) 静默钳制 → x/y batch 形状悄悄错位）、token 范围守卫（曾抓出负 token 被 numpy 静默回绕到词表末行——实测全 -1 输入 loss==0，模型「完美学会」垃圾）、y 对齐+切片指纹重放、确定性、T1 调度器端点+单调（l7_train 原宣称「门禁复检」但门禁不存在——与 G19 的 N3 同型宣称失配，已补齐）、梯度累积等价 accum=k==同 seed 重放 k batch 手动平均（逐位一致） | 0 失败 |
 | G22 原语不变性 | P3-P6 首次全部机检（宣称「门禁复检」但 4 条全无，已补齐）+ 边界守卫：RoPE 保范（含 20000 长度外推、1e-6~1e6 量级，1.63e-16）、相对位置性质（带非恒真性对照：位置差使内积变化 4.02e+00，否则恒等 RoPE 也能骗过门禁）、因果性（扰动未来不影响过去，0.00e+00）、注意力行和（4 组 GQA 组合，2.22e-16）；曾抓出「causal_mask_rect(Tq>Tk) 全 -inf 行 → softmax 0/0 → attention 静默 NaN 16/40」与「rope_tables 奇数维拼出 dim−1 表且构造阶段不报错」两个真实缺陷；P2「RMSNorm 输出 RMS 恒为 1」证伪（eps=1e-8 平滑项致偏差 2.67e-08），修正为精确闭式命题而非放宽阈值 | 0 失败 |
 | G23 GDN 归一化 | L1-L3 全部机检：**l2norm 单位范数契约** ‖k̂‖==1 对任意 ‖k‖（含 1e-12）成立、零向量→零输出——曾因分母 +1e-8 使 ‖k̂‖ 只剩 0.181（偏差 82%，delta rule 有效写入强度 β‖k̂‖² 被静默缩小到 0.016）；**尺度自适应梯度检验**（gradcheck 固定步长 1e-5 对 ‖k‖~1e-7 输入测量本身失效，已记入 l1_contract 局限）——同一公式配旧前向的相对误差 = eps/(‖k‖+eps)，‖k‖=1e-7 时达 17%；**三路径边界等价** α,β∈{0,0.5,1} × ‖k‖∈{1,1e-7,1e8} × chunk∈{1,3,T,T+5} 共 108 组，最大差 3.06e-16 | 0 失败 |
-| G24 基准熵下界 | E1 熵率自洽（2 阶马尔可夫源 H 由解析平稳分布法与 oracle 交叉熵法两套独立算法算出，差<5e-3，0<H<log(vocab)）+ E2 损失不破下界护栏（未训练模型验证 CE ≥ H，sub-entropy 即 loss bug）+ E3 基准诚实性（读 bench.json 断言各配置 learned fraction ≤ 1，本基准最大 −0.032 即无任何配置学会语料，见 BENCHMARKS.md 诚实结论） | H=3.0356 nats |
+| G24 基准熵下界 | E1 熵率自洽（2 阶马尔可夫源 H 由解析平稳分布法与 oracle 交叉熵法两套独立算法算出，差<5e-3，0<H<log(vocab)）+ E2 损失不破下界护栏（未训练模型验证 CE ≥ H，sub-entropy 即 loss bug）+ E3a 基准诚实性（读 bench.json 断言主基准各配置 learned fraction ≤ 1，最大 −0.032 即无任何配置学会语料）+ E3b 基准判别力（B7 可学性对照臂：一阶 vocab=8 同源语料上 lf_full>0.5 且模型全量 val 与同序列 oracle 差<0.05——证明基准不是永远学不会的钝器，见 BENCHMARKS.md B7） | H=3.0356 nats |
 | G25 全模型反向一致性 | 完整模型（GDN+MLA+MoE+MTP 装配）解析反向 vs 中心差分：抽样 336 条目最大混合比值 2.49e-03（判据 \|a−n\|≤atol+rtol·\|n\|，≤1 即过）—— G2 只校验独立原语反向，本门禁补齐 model.py 把它们装配成完整 Transformer 后的端到端反向（残差顺序/Pre-Norm/MoE 路由/MTP 头梯度），抓住「会训练却永远训不好」的阴险接线 bug | 2.49e-03 |
 | G26 基准 train/val 同源 | 机检基准语料 train/val 是否同源（修一个曾污染全基准的 bug）：markov_tokens 每次调用都重抽转移矩阵，旧 run_bench 用 seed 与 seed+7 分别生成 train/val ⇒ 竟是两个不同马尔可夫源，val 永远到不了 H、learned fraction 失效（把「能学会」误判成「学不会」）。修复：markov_train_val 只抽一次转移矩阵、采两条独立序列。E1 断言同源 val 的 oracle NLL≈H（3.0369 vs 3.0356），E2 以「不同源 ⇒ NLL 显著>H（6.96）」反证对照，证明对该 bug 敏感、能抓回归 | 同源 |
 
@@ -284,7 +284,7 @@ checkpoint 加载时**强制校验 sha256 与参数指纹**，损坏文件直接
 ### 一键复现全部基准
 
 ```bash
-python bench/run_bench.py --steps 120 --seed 0     # 约 2 分钟，写 bench/results/bench.json
+python bench/run_bench.py --steps 120 --seed 0     # 约 7 分钟（含 B7 对照臂），写 bench/results/bench.json
 ```
 
 ### 所有命令（Makefile）
@@ -358,6 +358,25 @@ NumPy 2.5.4 纯 CPU、合成 2 阶马尔可夫语料（vocab=64）、d_model=64 
 
 默认仍是 Muon2（少 40% NS 迭代）；追求本规模极限验证质量可切 Muon（`--optim muon`）。
 
+### B7 · 可学性对照臂（证明基准不是钝器）
+
+主基准所有配置都学不会（learned fraction 全负）会引出质疑：「是架构学不会，
+还是基准测不出差异？」B7 用**同一模型规模、同一协议、同一 seed**，只把语料换成
+规模内可学的一阶马尔可夫（vocab=8、60k/15k 同源、H=1.5533、600 步）：
+
+| 架构 | 训练 loss | full val | lf_full | 同序列 oracle |
+|---|---:|---:|---:|---:|
+| Hybrid 3:1（GDN + MLA） | 1.7411 | 1.5494 | **+1.007** | 1.5449 |
+| 全注意力（MLA） | 1.7444 | 1.5489 | **+1.008** | 1.5449 |
+| 全 GDN（无注意力） | 1.7422 | 1.5520 | **+1.003** | 1.5449 |
+
+**结论**：① 基准判别力成立——同一指标在主基准量到 lf≈−0.1、在对照臂量到
+lf≈+1.0，模型与真实源 oracle 差仅 0.004~0.007 nats（门禁 G24·E3b 机检），
+「学不会」是数据稀缺不是基准缺陷；② **三架构在指标灵敏的任务上依然打平**
+（full val 极差 0.003 nats）——B1「本规模无架构差异」的修订结论因此有了
+灵敏测量背书；③ 1024-token 子采样上 lf 冲到 +1.098、全量回落到 +1.007，
+量化了 B1-B3 那 ~0.05 nats 差异的噪声量级。详见 [BENCHMARKS.md](BENCHMARKS.md) B7。
+
 ### 与现有最优方案的定位对比
 
 | 维度 | **本项目** | nanoGPT | llama.cpp | fla (flash-linear-attention) |
@@ -384,7 +403,7 @@ NumPy 2.5.4 纯 CPU、合成 2 阶马尔可夫语料（vocab=64）、d_model=64 
 | **[SPEC.md](SPEC.md)** | 项目定位、核心能力、技术选型对比、**16 项可量化验收指标**与判据依据 |
 | **[docs/API.md](docs/API.md)** | **完整 API 说明**：L0–L10 全部公开接口、参数、返回值与示例 |
 | **[ARCHITECTURE.md](ARCHITECTURE.md)** | 十层架构详解、数学推导、逐层选型与被否决方案、反向传播顺序留档 |
-| **[BENCHMARKS.md](BENCHMARKS.md)** | 6 组基准数据与诚实解读（含一条负面结果） |
+| **[BENCHMARKS.md](BENCHMARKS.md)** | 7 组基准数据与诚实解读（含一条负面结果、一个可学性对照臂） |
 | [README.md](README.md) | 本文件：总览、快速开始、复现、性能对比、引用清单 |
 
 ---

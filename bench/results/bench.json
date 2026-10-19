@@ -19,9 +19,9 @@
       "final_loss": 4.314504642635978,
       "best_loss": 4.207638883303518,
       "val_loss": 4.248118121429763,
-      "seconds": 21.656007528305054,
-      "tokens_per_s": 1418.544021091978,
-      "ms_per_step": 180.46672940254211,
+      "seconds": 23.509296417236328,
+      "tokens_per_s": 1306.7171154249004,
+      "ms_per_step": 195.9108034769694,
       "name": "Hybrid 3:1 (GDN+MLA)"
     },
     {
@@ -30,9 +30,9 @@
       "final_loss": 4.3530063184604355,
       "best_loss": 4.166576161229913,
       "val_loss": 4.270488518641816,
-      "seconds": 11.910465478897095,
-      "tokens_per_s": 2579.244283477379,
-      "ms_per_step": 99.25387899080913,
+      "seconds": 12.920395851135254,
+      "tokens_per_s": 2377.636130807926,
+      "ms_per_step": 107.66996542612712,
       "name": "全注意力 (MLA)"
     },
     {
@@ -41,9 +41,9 @@
       "final_loss": 4.382315697220887,
       "best_loss": 4.302707808929418,
       "val_loss": 4.194387386813636,
-      "seconds": 21.234636783599854,
-      "tokens_per_s": 1446.692981521868,
-      "ms_per_step": 176.95530652999878,
+      "seconds": 21.143476486206055,
+      "tokens_per_s": 1452.9304118952077,
+      "ms_per_step": 176.19563738505045,
       "name": "全 GDN (无注意力)"
     }
   ],
@@ -54,9 +54,9 @@
       "final_loss": 4.314504642635978,
       "best_loss": 4.207638883303518,
       "val_loss": 4.248118121429763,
-      "seconds": 20.319254398345947,
-      "tokens_per_s": 1511.866498531595,
-      "ms_per_step": 169.32711998621622,
+      "seconds": 19.155969381332397,
+      "tokens_per_s": 1603.6776520397248,
+      "ms_per_step": 159.63307817777,
       "name": "layout=interleave",
       "layout": "interleave"
     },
@@ -66,9 +66,9 @@
       "final_loss": 4.478120097840924,
       "best_loss": 4.365511932953956,
       "val_loss": 4.202734367714971,
-      "seconds": 18.67558240890503,
-      "tokens_per_s": 1644.9286200226807,
-      "ms_per_step": 155.6298534075419,
+      "seconds": 17.479857444763184,
+      "tokens_per_s": 1757.4514035412485,
+      "ms_per_step": 145.66547870635986,
       "name": "layout=edge",
       "layout": "edge"
     }
@@ -80,9 +80,9 @@
       "final_loss": 4.112131965914079,
       "best_loss": 3.9536202169700894,
       "val_loss": 4.232226687083219,
-      "seconds": 17.392242670059204,
-      "tokens_per_s": 1766.30470162911,
-      "ms_per_step": 144.9353555838267,
+      "seconds": 16.767801761627197,
+      "tokens_per_s": 1832.0827283575209,
+      "ms_per_step": 139.7316813468933,
       "name": "adamw",
       "lr": 0.003
     },
@@ -92,9 +92,9 @@
       "final_loss": 4.487526880183647,
       "best_loss": 4.421367815927619,
       "val_loss": 4.200327257525575,
-      "seconds": 21.223623275756836,
-      "tokens_per_s": 1447.4437093448892,
-      "ms_per_step": 176.86352729797363,
+      "seconds": 20.029784679412842,
+      "tokens_per_s": 1533.715938123631,
+      "ms_per_step": 166.91487232844034,
       "name": "muon",
       "lr": 0.03
     },
@@ -104,9 +104,9 @@
       "final_loss": 4.314504642635978,
       "best_loss": 4.207638883303518,
       "val_loss": 4.248118121429763,
-      "seconds": 19.671269416809082,
-      "tokens_per_s": 1561.6684083310754,
-      "ms_per_step": 163.92724514007568,
+      "seconds": 19.278714656829834,
+      "tokens_per_s": 1593.4672278121448,
+      "ms_per_step": 160.65595547358194,
       "name": "muon2",
       "lr": 0.03
     }
@@ -164,5 +164,65 @@
     "tokens_per_verify": 1.0,
     "gamma3_tokens_per_forward": 3.2
   },
-  "timestamp": "2026-10-20 02:56:11"
+  "learnable": {
+    "corpus": {
+      "order": 1,
+      "vocab": 8,
+      "n_train": 60000,
+      "n_val": 15000,
+      "same_source": true,
+      "note": "markov_train_val 单源双采样（同源留出，门禁 G26 同款）"
+    },
+    "H": 1.5533217497754734,
+    "uniform": 2.0794415416798357,
+    "steps": 600,
+    "rows": [
+      {
+        "params": 392960,
+        "layers": "LLLALL",
+        "final_loss": 1.7410855447439602,
+        "best_loss": 1.5507581563722506,
+        "val_loss": 1.501542305360714,
+        "seconds": 89.57190823554993,
+        "tokens_per_s": 1714.823352831487,
+        "ms_per_step": 149.28651372591654,
+        "val_loss_full": 1.5494254110478032,
+        "oracle_nll_full": 1.544864456826611,
+        "name": "Hybrid 3:1 (GDN+MLA)",
+        "learned_fraction": 1.0984175946457682,
+        "learned_fraction_full": 1.0074058014688383
+      },
+      {
+        "params": 360640,
+        "layers": "AAAAAA",
+        "final_loss": 1.7444404684303216,
+        "best_loss": 1.5502051122509117,
+        "val_loss": 1.5018872729223143,
+        "seconds": 46.18791079521179,
+        "tokens_per_s": 3325.5455238283566,
+        "ms_per_step": 76.97985132535298,
+        "val_loss_full": 1.5488806888517426,
+        "oracle_nll_full": 1.544864456826611,
+        "name": "全注意力 (MLA)",
+        "learned_fraction": 1.0977619121055777,
+        "learned_fraction_full": 1.0084411592037925
+      },
+      {
+        "params": 392960,
+        "layers": "LLLLLA",
+        "final_loss": 1.742187224945015,
+        "best_loss": 1.551587926125622,
+        "val_loss": 1.5042415292051587,
+        "seconds": 87.58690309524536,
+        "tokens_per_s": 1753.6868478266604,
+        "ms_per_step": 145.97817182540894,
+        "val_loss_full": 1.551961928419474,
+        "oracle_nll_full": 1.544864456826611,
+        "name": "全 GDN (无注意力)",
+        "learned_fraction": 1.0932871587907045,
+        "learned_fraction_full": 1.0025846230780968
+      }
+    ]
+  },
+  "timestamp": "2026-10-20 05:56:29"
 }
