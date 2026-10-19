@@ -82,6 +82,19 @@
                     (f) clip 全局语义；(g) AdamW 首步解析值（偏差修正）；
                     (h) O5 确定性；(i) Muon2 梯度尺度不变；(j) O4 凸问题
                     损失单调下降
+    G20 持久化完整性    P1-P7 全部机检 + 损坏注入对抗：(a) 路径规范化闭环 ——
+                    探针抓出「np.savez 自动追加 .npz 使 _sha256_file 找错
+                    文件直接 FileNotFoundError」的真实缺陷（已修复为
+                    save/load/info 三路共用规范化）；(b) 截断 meta.json
+                    双路径必须抛 CheckpointError —— 抓出「漏出原始
+                    JSONDecodeError，调用方 except CheckpointError 会漏」
+                    的类型不一致（已修复）；(c) 损坏权重 sha256 失配；
+                    (d) 权重替换+sha 同步篡改被参数指纹抓住（威胁模型如实
+                    声明：防失配腐烂，不防同步作恶）；(e) 原子性 —— 模拟
+                    meta 写入崩溃，无 tmp 半成品、旧 checkpoint 逐位完好
+                    可加载（对齐 safetensors 的 tmp+rename 模式）；(f) 空
+                    参数/怪异参数名/dtype 保持；(g) 保存确定性 + 指纹失配
+                    检出 + 缺失 meta/不存在路径响亮失败
 """
 
 from __future__ import annotations
@@ -1031,6 +1044,186 @@ def run_all_gates(seed: int = 0, steps: int = 60, verbose: bool = True) -> GateR
         muon2_noop=muon2_pure_rel, guard=guard19_ok, recover=recover19,
         clip=clip_ok, adam_first=adam_first_rel, det=det_ok,
         muon2_scale=m2_rel, convex=convex_ok)
+    R.results[-1].seconds = time.time() - t0
+
+    # ---------------------------------------------------------- G20 持久化完整性
+    t0 = time.time()
+    import os as _os
+    import json as _json
+    import hashlib as _hashlib
+    import tempfile as _tempfile
+    import shutil as _shutil
+    from .persist import (save_checkpoint as _save_ckpt,
+                          load_checkpoint as _load_ckpt,
+                          checkpoint_info as _ckpt_info,
+                          CheckpointError as _CkptErr)
+    from .model import TianjiConfig as _Cfg
+    g20 = rng(spawn_seed(seed, "persist"))
+    _d20 = _tempfile.mkdtemp(prefix="tianji_g20_")
+    cfg20 = _Cfg(vocab_size=64, d_model=32, n_layers=2, n_heads=2, n_kv_heads=1)
+    P20 = {"w": g20.standard_normal((4, 3)), "b": g20.standard_normal((3,))}
+
+    def _ckpt_files20():
+        return sorted(f for f in _os.listdir(_d20))
+
+    try:
+        # ---- (a) P1 路径规范化闭环：无扩展名 save→load→info 一致
+        p_noext = _os.path.join(_d20, "noext")
+        _save_ckpt(p_noext, cfg20, P20)
+        p_norm = p_noext + ".npz"
+        norm_ok = (_os.path.exists(p_norm)
+                   and _os.path.exists(p_norm + ".meta.json")
+                   and not _os.path.exists(p_noext))
+        P20b, info20 = _load_ckpt(p_noext)
+        rt20 = (sorted(P20b) == sorted(P20)
+                and np.array_equal(P20b["w"], P20["w"])
+                and np.array_equal(P20b["b"], P20["b"]))
+        info20b = _ckpt_info(p_noext)
+        info20_ok = info20b["weights_sha256"] == info20["weights_sha256"]
+
+        # ---- (b) P2 损坏 meta（截断 JSON）→ CheckpointError（load + info 双路径）
+        p_trunc = _os.path.join(_d20, "trunc.npz")
+        _save_ckpt(p_trunc, cfg20, P20)
+        _raw = open(p_trunc + ".meta.json", encoding="utf-8").read()
+        with open(p_trunc + ".meta.json", "w", encoding="utf-8") as f:
+            f.write(_raw[: len(_raw) // 2])
+        meta_err_ok = True
+        for _fn in (lambda: _load_ckpt(p_trunc), lambda: _ckpt_info(p_trunc)):
+            try:
+                _fn()
+                meta_err_ok = False          # 损坏 meta 竟然加载成功了
+            except _CkptErr:
+                pass
+            except Exception:
+                meta_err_ok = False          # 漏出非 CheckpointError 类型
+
+        # ---- (c) P3 损坏权重（翻字节）→ CheckpointError
+        p_corrupt = _os.path.join(_d20, "corrupt.npz")
+        _save_ckpt(p_corrupt, cfg20, P20)
+        _buf = bytearray(open(p_corrupt, "rb").read())
+        _buf[len(_buf) // 2] ^= 0xFF
+        with open(p_corrupt, "wb") as f:
+            f.write(bytes(_buf))
+        try:
+            _load_ckpt(p_corrupt)
+            w_corrupt_ok = False
+        except _CkptErr:
+            w_corrupt_ok = True
+        except Exception:
+            w_corrupt_ok = False
+
+        # ---- (d) P4 权重替换 + sha 同步篡改 → 参数指纹抓住（部分失配场景）
+        p_tamper = _os.path.join(_d20, "tamper.npz")
+        _save_ckpt(p_tamper, cfg20, P20)
+        _Q = {"w": g20.standard_normal((4, 3)), "b": P20["b"]}
+        np.savez_compressed(p_tamper, **_Q)
+        _info = _json.load(open(p_tamper + ".meta.json", encoding="utf-8"))
+        _h = _hashlib.sha256()
+        with open(p_tamper, "rb") as f:
+            _h.update(f.read())
+        _info["weights_sha256"] = _h.hexdigest()      # 攻击者同步 sha
+        with open(p_tamper + ".meta.json", "w", encoding="utf-8") as f:
+            _json.dump(_info, f)
+        try:
+            _load_ckpt(p_tamper)
+            tamper_ok = False
+        except _CkptErr:
+            tamper_ok = True
+        except Exception:
+            tamper_ok = False
+
+        # ---- (e) P5 原子性：meta 写入崩溃 → 无 tmp 残留 + 旧 checkpoint 完好
+        import tianji.persist as _PS
+        p_atom = _os.path.join(_d20, "atom.npz")
+        _save_ckpt(p_atom, cfg20, P20)
+        _orig_bytes = open(p_atom, "rb").read()
+        _orig_dump = _PS.json.dump
+        def _explode(*a, **k):
+            raise OSError("simulated disk full")
+        _PS.json.dump = _explode
+        try:
+            _save_ckpt(p_atom, cfg20, {"w": P20["w"] * 99.0})
+        except OSError:
+            pass
+        finally:
+            _PS.json.dump = _orig_dump
+        atomic_ok = (not [f for f in _ckpt_files20() if ".tmp" in f]
+                     and open(p_atom, "rb").read() == _orig_bytes)
+        P20c, _ = _load_ckpt(p_atom)
+        atomic_ok = atomic_ok and np.array_equal(P20c["w"], P20["w"])
+
+        # ---- (f) P6 空参数 / 怪异参数名 / dtype 保持
+        p_empty = _os.path.join(_d20, "empty.npz")
+        _save_ckpt(p_empty, cfg20, {})
+        P20e, ie = _load_ckpt(p_empty)
+        empty_ok = len(P20e) == 0 and ie["n_params"] == 0
+        _weird = {"model.layers.0.w": P20["w"], "a/b": P20["w"],
+                  "权重": P20["w"], "w.npy": P20["w"]}
+        p_weird = _os.path.join(_d20, "weird.npz")
+        _save_ckpt(p_weird, cfg20, _weird)
+        P20w, _ = _load_ckpt(p_weird)
+        weird_ok = sorted(P20w) == sorted(_weird)
+        p_dt = _os.path.join(_d20, "dt.npz")
+        _save_ckpt(p_dt, cfg20, {"w": P20["w"].astype(np.float32)})
+        P20d, _ = _load_ckpt(p_dt)
+        dtype_ok = P20d["w"].dtype == np.float32
+
+        # ---- (g) P7 覆盖保存失配检出 + 保存确定性（同参数两次 digest 相同）
+        p_ow = _os.path.join(_d20, "ow.npz")
+        d1 = _save_ckpt(p_ow, cfg20, P20)
+        d2 = _save_ckpt(p_ow, cfg20, P20)
+        det_ok = d1 == d2
+        _info = _json.load(open(p_ow + ".meta.json", encoding="utf-8"))
+        _info["params_fingerprint"] = "0" * 64       # 失配的旧指纹
+        with open(p_ow + ".meta.json", "w", encoding="utf-8") as f:
+            _json.dump(_info, f)
+        try:
+            _load_ckpt(p_ow)
+            ow_ok = False
+        except _CkptErr:
+            ow_ok = True
+        except Exception:
+            ow_ok = False
+
+        # ---- (h) 缺失 meta / 不存在路径 → CheckpointError（响亮失败）
+        p_nometa = _os.path.join(_d20, "nometa.npz")
+        _save_ckpt(p_nometa, cfg20, P20)
+        _os.unlink(p_nometa + ".meta.json")
+        miss_ok = True
+        for _fn in (lambda: _load_ckpt(p_nometa), lambda: _ckpt_info(p_nometa),
+                    lambda: _load_ckpt(_os.path.join(_d20, "ghost.npz"))):
+            try:
+                _fn()
+                miss_ok = False
+            except _CkptErr:
+                pass
+            except Exception:
+                miss_ok = False
+    except Exception as e:                            # 门禁异常安全：报 FAIL 不掀翻套件
+        norm_ok = rt20 = info20_ok = meta_err_ok = w_corrupt_ok = False
+        tamper_ok = atomic_ok = empty_ok = weird_ok = dtype_ok = False
+        det_ok = ow_ok = miss_ok = False
+        _g20_exc = f"{type(e).__name__}: {e}"
+    else:
+        _g20_exc = None
+    finally:
+        _shutil.rmtree(_d20, ignore_errors=True)
+
+    ok20 = (norm_ok and rt20 and info20_ok and meta_err_ok and w_corrupt_ok
+            and tamper_ok and atomic_ok and empty_ok and weird_ok and dtype_ok
+            and det_ok and ow_ok and miss_ok and _g20_exc is None)
+    add("持久化完整性", ok20,
+        (f"门禁执行异常: {_g20_exc}" if _g20_exc else
+         f"P1 无扩展名路径闭环={norm_ok}（曾 FileNotFoundError，已修复规范化）；"
+         f"P2 损坏 meta 双路径 CheckpointError={meta_err_ok}（曾漏出 "
+         f"JSONDecodeError）；P3 损坏权重={w_corrupt_ok}；P4 sha 同步篡改被"
+         f"指纹抓住={tamper_ok}；P5 原子性（崩溃无半成品+旧件完好）={atomic_ok}；"
+         f"P6 空参数={empty_ok}/怪异名={weird_ok}/dtype={dtype_ok}；"
+         f"P7 保存确定性={det_ok}/失配检出={ow_ok}；缺失 meta={miss_ok}"),
+        norm=norm_ok, roundtrip=rt20, info=info20_ok, meta_err=meta_err_ok,
+        w_corrupt=w_corrupt_ok, tamper=tamper_ok, atomic=atomic_ok,
+        empty=empty_ok, weird=weird_ok, dtype=dtype_ok, det=det_ok,
+        overwrite=ow_ok, missing=miss_ok)
     R.results[-1].seconds = time.time() - t0
 
     return R

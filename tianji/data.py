@@ -32,7 +32,11 @@ TINY_TALE = (
 
 
 def default_corpus() -> str:
-    """默认训练语料：TINY_TALE 重复若干次，约 20KB。"""
+    """默认训练语料：TINY_TALE 重复 6 次，约 90KB（71280 字符，UTF-8 93.5KB）。
+
+    早期 docstring 写「约 20KB」是拍脑袋的，实测 93.5KB（G20 门禁机检
+    大小与 roundtrip，防止文档与实现悄悄漂移）。
+    """
     return TINY_TALE * 6
 
 

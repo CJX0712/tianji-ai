@@ -413,13 +413,18 @@ from tianji import save_checkpoint, load_checkpoint, checkpoint_info, Checkpoint
 ```
 
 ### `save_checkpoint(path, cfg, params, *, meta=None, tokenizer_path=None) -> sha256`
-落盘 `<path>`（npz 压缩）与 `<path>.meta.json`（配置 + 参数表 + 指纹 + 校验和）。
+落盘 `<path>.npz`（npz 压缩）与 `<path>.npz.meta.json`（配置 + 参数表 + 指纹 + 校验和）。
+路径不带 `.npz` 后缀时自动补全（`save`/`load`/`checkpoint_info` 三路同一规范化，
+传什么名字进去就原样传出来）。**原子落盘**：先写临时文件再 `os.replace`，
+保存中途崩溃不留半成品，旧 checkpoint 始终配对完好（对齐 safetensors 模式）。
 
 ### `load_checkpoint(path, *, verify=True) -> (params, info)`
 `verify=True` 时强制校验 sha256 与参数指纹，**不一致直接抛 `CheckpointError`**。
+损坏的 meta.json（截断/非法 JSON）、损坏的权重、参数集合/指纹失配、版本不兼容、
+文件缺失 —— 全部转成 `CheckpointError`，调用方只需捕获这一种。
 
 ### `checkpoint_info(path) -> dict`
-只读元数据，不加载权重。
+只读元数据，不加载权重。损坏同样抛 `CheckpointError`。
 
 ---
 
@@ -430,7 +435,7 @@ from tianji import TINY_TALE, default_corpus, markov_tokens
 ```
 
 - `TINY_TALE` —— 极小的中英混合文本
-- `default_corpus()` —— 默认训练语料（约 20KB）
+- `default_corpus()` —— 默认训练语料（约 93.5KB，71280 字符）
 - `markov_tokens(n, vocab, seed=0, order=2)` —— 确定性合成马尔可夫序列（基准用，有明确熵下界）
 
 全部离线，无任何下载。
@@ -443,7 +448,7 @@ from tianji import TINY_TALE, default_corpus, markov_tokens
 from tianji import run_all_gates, GateReport, GateResult
 rep = run_all_gates(seed=0, steps=40)
 print(rep.table())        # G1..G10 的 PASS/FAIL 与实测值
-rep.all_green             # 是否 19/19
+rep.all_green             # 是否 20/20
 ```
 
 ---
@@ -451,7 +456,7 @@ rep.all_green             # 是否 19/19
 ## 命令行
 
 ```bash
-python -m tianji.cli gates      # 19 道交付门禁
+python -m tianji.cli gates      # 20 道交付门禁
 python -m tianji.cli test       # 模块梯度检验冒烟
 python -m tianji.cli bench      # 完整基准
 python -m tianji.cli microops   # 微指令统计（--show 列出全部家族）

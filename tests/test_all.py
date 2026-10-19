@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import json
 import os
+import shutil
 import sys
+import tempfile
 
 import numpy as np
 import pytest
@@ -30,6 +33,8 @@ from tianji.l8_infer import (                               # noqa: E402
     quantize_per_channel, quantize_groupwise, dequantize, speculative_decode)
 from tianji.l10_microops import MICROOPS, FAMILIES, run_all as micro_all  # noqa: E402
 from tianji.model import TianjiConfig, TianjiModel, init_params, build_layer_layout  # noqa: E402
+from tianji.persist import (save_checkpoint, load_checkpoint,  # noqa: E402
+                            checkpoint_info, CheckpointError)
 from tianji.verify import run_all_gates                     # noqa: E402
 
 
@@ -990,6 +995,175 @@ def test_spec_decode_gamma_statistical_lossless():
                                    20, gamma=2, seed=7, draft_model=d)
     assert len(ids2) == 22 and st2.produced == 20
     assert st2.steps >= 1 and np.all(np.isfinite(np.asarray(ids2)))
+
+
+# ============================================================ 持久化（G20）
+
+@pytest.fixture()
+def ckpt_dir():
+    d = tempfile.mkdtemp(prefix="tianji_test_ckpt_")
+    yield d
+    shutil.rmtree(d, ignore_errors=True)
+
+
+def _ckpt_cfg():
+    return TianjiConfig(vocab_size=64, d_model=32, n_layers=2,
+                        n_heads=2, n_kv_heads=1)
+
+
+def _ckpt_params():
+    g = rng(5)
+    return {"w": g.standard_normal((4, 3)), "b": g.standard_normal((3,))}
+
+
+def test_save_load_roundtrip_values(ckpt_dir):
+    """P6：值/形状/dtype 逐位保持。"""
+    p = os.path.join(ckpt_dir, "rt.npz")
+    P = _ckpt_params()
+    save_checkpoint(p, _ckpt_cfg(), P)
+    P2, info = load_checkpoint(p)
+    assert sorted(P2) == sorted(P)
+    for k in P:
+        assert np.array_equal(P2[k], P[k]) and P2[k].dtype == P[k].dtype
+    assert info["n_params"] == sum(v.size for v in P.values())
+
+
+def test_save_without_npz_extension(ckpt_dir):
+    """P1（G20 抓出的真实缺陷）：无 .npz 路径 save→load→info 闭环。
+
+    缺陷版：np.savez 自动追加 .npz，_sha256_file 却找原路径 →
+    FileNotFoundError。修复：三路共用 _normalize_path。
+    """
+    p = os.path.join(ckpt_dir, "noext")
+    save_checkpoint(p, _ckpt_cfg(), _ckpt_params())
+    assert os.path.exists(p + ".npz")
+    assert os.path.exists(p + ".npz.meta.json")
+    assert not os.path.exists(p)                    # 不会落下无后缀的孤儿文件
+    P2, _ = load_checkpoint(p)                      # 原样传回去即可加载
+    assert sorted(P2) == ["b", "w"]
+    assert checkpoint_info(p)["library"] == "tianji"
+
+
+def test_truncated_meta_raises_checkpoint_error(ckpt_dir):
+    """P2（G20 抓出的类型不一致）：截断 meta 必须抛 CheckpointError。
+
+    缺陷版漏出 json.JSONDecodeError，调用方 except CheckpointError 抓不到。
+    """
+    p = os.path.join(ckpt_dir, "trunc.npz")
+    save_checkpoint(p, _ckpt_cfg(), _ckpt_params())
+    raw = open(p + ".meta.json", encoding="utf-8").read()
+    with open(p + ".meta.json", "w", encoding="utf-8") as f:
+        f.write(raw[: len(raw) // 2])
+    with pytest.raises(CheckpointError):
+        load_checkpoint(p)
+    with pytest.raises(CheckpointError):
+        checkpoint_info(p)
+
+
+def test_corrupt_weights_raises(ckpt_dir):
+    """P3：翻字节的权重被 sha256 抓住。"""
+    p = os.path.join(ckpt_dir, "corrupt.npz")
+    save_checkpoint(p, _ckpt_cfg(), _ckpt_params())
+    buf = bytearray(open(p, "rb").read())
+    buf[len(buf) // 2] ^= 0xFF
+    with open(p, "wb") as f:
+        f.write(bytes(buf))
+    with pytest.raises(CheckpointError):
+        load_checkpoint(p)
+
+
+def test_fingerprint_catches_sha_synced_tamper(ckpt_dir):
+    """P4：权重替换 + sha 同步篡改，参数指纹仍抓住（部分失配场景）。"""
+    import hashlib
+    p = os.path.join(ckpt_dir, "tamper.npz")
+    P = _ckpt_params()
+    save_checkpoint(p, _ckpt_cfg(), P)
+    np.savez_compressed(p, w=rng(9).standard_normal((4, 3)), b=P["b"])
+    info = json.load(open(p + ".meta.json", encoding="utf-8"))
+    info["weights_sha256"] = hashlib.sha256(open(p, "rb").read()).hexdigest()
+    with open(p + ".meta.json", "w", encoding="utf-8") as f:
+        json.dump(info, f)
+    with pytest.raises(CheckpointError):
+        load_checkpoint(p)
+
+
+def test_atomic_save_no_half_products(ckpt_dir, monkeypatch):
+    """P5：保存中途崩溃不留半成品，旧 checkpoint 逐位完好。
+
+    对齐 safetensors.save_file 的 tmp + os.replace 模式。
+    """
+    import tianji.persist as PS
+    p = os.path.join(ckpt_dir, "atom.npz")
+    P = _ckpt_params()
+    save_checkpoint(p, _ckpt_cfg(), P)
+    orig = open(p, "rb").read()
+
+    def _explode(*a, **k):
+        raise OSError("simulated disk full")
+
+    monkeypatch.setattr(PS.json, "dump", _explode)
+    with pytest.raises(OSError):
+        save_checkpoint(p, _ckpt_cfg(), {"w": P["w"] * 99.0})
+    assert not [f for f in os.listdir(ckpt_dir) if ".tmp" in f]
+    assert open(p, "rb").read() == orig          # 旧件逐位完好
+    P2, _ = load_checkpoint(p)
+    assert np.array_equal(P2["w"], P["w"])       # 旧件仍可加载
+
+
+def test_empty_and_weird_param_names(ckpt_dir):
+    """P6：空参数、点/斜杠/unicode 参数名 roundtrip。"""
+    save_checkpoint(os.path.join(ckpt_dir, "empty.npz"), _ckpt_cfg(), {})
+    P, info = load_checkpoint(os.path.join(ckpt_dir, "empty.npz"))
+    assert len(P) == 0 and info["n_params"] == 0
+    names = {"model.layers.0.w": np.eye(3), "a/b": np.eye(3),
+             "权重": np.eye(3), "w.npy": np.eye(3)}
+    p = os.path.join(ckpt_dir, "weird.npz")
+    save_checkpoint(p, _ckpt_cfg(), names)
+    P2, _ = load_checkpoint(p)
+    assert sorted(P2) == sorted(names)
+
+
+def test_dtype_preserved(ckpt_dir):
+    p = os.path.join(ckpt_dir, "dt.npz")
+    save_checkpoint(p, _ckpt_cfg(), {"w": _ckpt_params()["w"].astype(np.float32)})
+    P2, _ = load_checkpoint(p)
+    assert P2["w"].dtype == np.float32
+
+
+def test_save_deterministic_and_overwrite_mismatch(ckpt_dir):
+    """P7：同参数两次保存 digest 相同；指纹失配被检出。"""
+    p = os.path.join(ckpt_dir, "ow.npz")
+    P = _ckpt_params()
+    d1 = save_checkpoint(p, _ckpt_cfg(), P)
+    d2 = save_checkpoint(p, _ckpt_cfg(), P)
+    assert d1 == d2
+    info = json.load(open(p + ".meta.json", encoding="utf-8"))
+    info["params_fingerprint"] = "0" * 64
+    with open(p + ".meta.json", "w", encoding="utf-8") as f:
+        json.dump(info, f)
+    with pytest.raises(CheckpointError):
+        load_checkpoint(p)
+
+
+def test_missing_meta_and_ghost_path(ckpt_dir):
+    """缺失 meta / 不存在路径：一律 CheckpointError 响亮失败。"""
+    p = os.path.join(ckpt_dir, "nometa.npz")
+    save_checkpoint(p, _ckpt_cfg(), _ckpt_params())
+    os.unlink(p + ".meta.json")
+    with pytest.raises(CheckpointError):
+        load_checkpoint(p)
+    with pytest.raises(CheckpointError):
+        checkpoint_info(p)
+    with pytest.raises(CheckpointError):
+        load_checkpoint(os.path.join(ckpt_dir, "ghost.npz"))
+
+
+def test_default_corpus_size_claim():
+    """data.py 宣称核对：docstring 写 93.5KB 必须与实现一致（曾写 20KB）。"""
+    from tianji.data import default_corpus
+    c = default_corpus()
+    kb = len(c.encode("utf-8")) / 1024
+    assert 90 < kb < 100, f"corpus 大小漂移: {kb:.1f}KB"
 
 
 # ============================================================ 门禁
