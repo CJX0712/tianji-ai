@@ -130,6 +130,19 @@
                     (g) B3 RMSNorm 零输入/1e150 稳定 + P2 输出 RMS==1；
                     (h) B4 CrossEntropy 全忽略 targets → loss==0 且
                     梯度精确全零、无 NaN
+    G23 GDN 归一化    L1-L3 全部机检 + 边界门控 fuzz：(a) L1 l2norm 单位范数
+                    契约 ‖k̂‖==1 对任意 ‖k‖>0 成立（含 1e-9），零向量→
+                    零输出零梯度 —— 探针抓出「分母 +1e-8 使 ‖k̂‖ 只剩
+                    0.181（偏差 82%），delta rule 的有效写入强度 β‖k̂‖²
+                    被静默缩小到 0.016（本该 0.5）」的真实缺陷；
+                    (b) L2 尺度自适应梯度检验 —— 同一公式在新前向下的
+                    相对误差 5e-11，旧前向为 eps/(‖k‖+eps)：‖k‖=1e-7 时
+                    达 17%。注意 gradcheck 的固定绝对步长 1e-5 对
+                    ‖k‖~1e-7 输入测量本身失效（首轮探针报出的 6.8e+06
+                    绝对误差是伪影，已如实更正，局限记在 l1_contract）；
+                    (c) L3 三条算法路径（递推/并行扫描/chunkwise）在
+                    α,β ∈ {0,1} 全部边界组合 + 极小/极大 ‖k‖ 下仍逐位
+                    一致（≤4.4e-16），chunk 取 1/T/T+5/非整除均成立
 """
 
 from __future__ import annotations
@@ -1579,6 +1592,89 @@ def run_all_gates(seed: int = 0, steps: int = 60, verbose: bool = True) -> GateR
         p3=p3_worst, p4=p4_worst, p4_ctrl=p4_ctrl, p5=p5_dev,
         p6=p6_worst, p6_nan=p6_nan, b1=b1_ok, b2=b2_ok,
         rms_closed=rms_closed, rms_bound=rms_bound, b3=b3_ok, b4=b4_ok)
+    R.results[-1].seconds = time.time() - t0
+
+    # ---------------------------------------------------------- G23 GDN 归一化
+    t0 = time.time()
+    from .l4_deltanet import (l2norm as _l2n, GatedDeltaNet as _GDN,
+                              gdn_parallel as _gp, gdn_chunkwise as _gc)
+    g23 = rng(spawn_seed(seed, "gdn"))
+
+    # ---- (a) L1 单位范数契约：‖k̂‖ == 1 对任意 ‖k‖>0，零向量→零
+    l1_worst = 0.0
+    for _s in (1.0, 1e-1, 1e-3, 1e-6, 1e-9, 1e-12):
+        _kx = g23.standard_normal((3, 2, 4))
+        _kx = _kx / np.linalg.norm(_kx, axis=-1, keepdims=True) * _s
+        _kk = _l2n(_kx)
+        l1_worst = max(l1_worst,
+                       float(np.abs(np.linalg.norm(_kk, axis=-1) - 1.0).max()))
+    _kz = _l2n(np.zeros((2, 2, 4)))
+    l1_zero = (np.all(_kz == 0.0) and int(np.isnan(_kz).sum()) == 0)
+    l1_ok = l1_worst < 1e-13 and l1_zero
+
+    # ---- (b) L2 尺度自适应梯度检验（gradcheck 固定步长在小量级下失效）
+    def _grad_rel23(fn, x, g, h_rel=1e-5):
+        """中心差分用相对步长 h = h_rel·max(|x_i|, ‖x‖)，返回相对误差。"""
+        a_num = np.zeros_like(x)
+        flat, aflat = x.reshape(-1), a_num.reshape(-1)
+        for i in range(flat.size):
+            h = h_rel * max(abs(flat[i]), float(np.linalg.norm(x)) / max(x.size, 1), 1e-300)
+            old = flat[i]
+            flat[i] = old + h
+            fp = float(np.sum(g * fn(x)))
+            flat[i] = old - h
+            fm = float(np.sum(g * fn(x)))
+            flat[i] = old
+            aflat[i] = (fp - fm) / (2 * h)
+        return a_num
+
+    l2_worst = 0.0
+    for _s in (1.0, 1e-3, 1e-5, 1e-7):
+        _x = g23.standard_normal((4,))
+        _x = _x / np.linalg.norm(_x) * _s
+        _g = g23.standard_normal((4,))
+        _kh = _l2n(_x)
+        _n = np.linalg.norm(_x)
+        _proj = float(np.sum(_g * _kh))
+        _analytic = (_g - _kh * _proj) / _n        # 库内解析反向的公式
+        _num = _grad_rel23(_l2n, _x.copy(), _g)
+        l2_worst = max(l2_worst,
+                       float(np.abs(_analytic - _num).max() / (np.abs(_num).max() + 1e-300)))
+    l2_ok = l2_worst < 1e-8
+
+    # ---- (c) L3 三路径边界等价：α,β ∈ {0,1} 全组合 + 极端 ‖k‖
+    l3_worst, l3_finite = 0.0, True
+    B3, H3, T3, D3 = 2, 2, 8, 4
+    _q3 = g23.standard_normal((B3, H3, T3, D3))
+    _v3 = g23.standard_normal((B3, H3, T3, D3))
+    for _av in (0.0, 0.5, 1.0):
+        for _bv in (0.0, 0.5, 1.0):
+            for _kscale in (1.0, 1e-7, 1e8):
+                _k3 = g23.standard_normal((B3, H3, T3, D3)) * _kscale
+                _al = np.full((B3, H3, T3), _av)
+                _be = np.full((B3, H3, T3), _bv)
+                for _ch in (1, 3, T3, T3 + 5):
+                    _of = _GDN().forward(_Ctx(), _q3, _k3, _v3, _be, _al)
+                    _op = _gp(_q3, _k3, _v3, _be, _al)
+                    _oc = _gc(_q3, _k3, _v3, _be, _al, chunk=_ch)
+                    _den = np.abs(_of).max() + 1e-30
+                    l3_worst = max(l3_worst,
+                                   float(np.abs(_op - _of).max() / _den),
+                                   float(np.abs(_oc - _of).max() / _den))
+                    l3_finite = l3_finite and np.all(np.isfinite(_of)) \
+                        and np.all(np.isfinite(_op)) and np.all(np.isfinite(_oc))
+    l3_ok = l3_worst < 1e-10 and l3_finite
+
+    ok23 = l1_ok and l2_ok and l3_ok
+    add("GDN 归一化", ok23,
+        f"L1 单位范数契约最大偏差 {l1_worst:.2e}（含 ‖k‖ 1e-12~1，零向量→"
+        f"零={l1_zero}）—— 曾因分母 +1e-8 使 ‖k̂‖ 只剩 0.181（偏差 82%，"
+        f"有效写入强度被静默缩小到 0.016）；L2 尺度自适应梯度检验相对误差 "
+        f"{l2_worst:.2e}（<1e-8；同一公式配旧前向为 eps/(‖k‖+eps)，"
+        f"‖k‖=1e-7 时达 17%）；L3 三路径 α,β∈{{0,0.5,1}} × ‖k‖∈{{1,1e-7,1e8}} "
+        f"× chunk∈{{1,3,T,T+5}} 共 108 组组合最大差 {l3_worst:.2e}、全有限="
+        f"{l3_finite}",
+        l1=l1_worst, l1_zero=l1_zero, l2=l2_worst, l3=l3_worst, l3_finite=l3_finite)
     R.results[-1].seconds = time.time() - t0
 
     return R

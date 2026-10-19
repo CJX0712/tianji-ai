@@ -33,6 +33,8 @@ from typing import Callable
 
 import numpy as np
 
+from .l4_deltanet import l2norm
+
 from .l0_numerics import logsumexp, softmax, spectral_norm, newton_schulz
 
 __all__ = ["MicroOp", "MICROOPS", "FAMILIES", "FAMILY_KIND", "run_all", "count_ops"]
@@ -189,7 +191,10 @@ def _norm():
     return _reg("norm", 1, {
         "rmsnorm": lambda x: x / (np.sqrt(np.mean(x ** 2, axis=-1, keepdims=True)) + 1e-8),
         "layernorm": ln,
-        "l2norm": lambda x: x / (np.linalg.norm(x, axis=-1, keepdims=True) + 1e-8),
+        # l2norm 必须与 L4 的实现同源 —— 归一化目录里的这一项就是设备中
+        # 真实使用的那个算子；分母若各写一套加法 eps，两侧语义会悄悄分叉
+        # （旧目录项用了 +1e-8，与 L4 修复后的「严格单位范数」不一致）
+        "l2norm": lambda x: l2norm(x),
         "l1norm": lambda x: x / (np.sum(np.abs(x), axis=-1, keepdims=True) + 1e-8),
         "zscore": lambda x: (x - np.mean(x)) / (np.std(x) + 1e-8),
         "minmax": lambda x: (x - np.min(x)) / (np.ptp(x) + 1e-8),

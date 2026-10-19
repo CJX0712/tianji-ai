@@ -9,7 +9,7 @@ on:
 
 jobs:
   verify:
-    name: TIANJI · 65 tests + 22 gates
+    name: TIANJI · 65 tests + 23 gates
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -24,7 +24,7 @@ jobs:
       - name: Unit tests (51)
         run: make test
 
-      - name: Delivery gates (22)
+      - name: Delivery gates (23)
         run: make gates
 
       - name: Quickstart smoke

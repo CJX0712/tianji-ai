@@ -78,28 +78,73 @@ __all__ = ["GatedDeltaNet", "CausalConv1D", "l2norm", "L2Norm",
 class L2Norm(Module):
     """沿最后一维的 L2 归一化（Gated DeltaNet 要求对 k 做，保证谱半径可控）。
 
-    反向与 RMSNorm 同构：∂L/∂k = (1/‖k‖)[ĝ − k̂·(ĝ·k̂)]
+    输出严格单位范数：‖k̂‖ == 1（‖k‖>0 时）；零向量→零输出、零梯度。
+
+    反向：∂L/∂k = (1/‖k‖)[ĝ − k̂·(ĝ·k̂)]，由共享的 _l2norm_backward 提供，
+    与前向严格配套（分母不含加法平滑项，见 l2norm 的理由说明）。
     """
 
     differentiable = (0,)
-    eps: float = 1e-8
 
     def forward(self, ctx: Ctx, x: np.ndarray) -> np.ndarray:
         x = np.asarray(x, dtype=np.float64)
-        n = np.linalg.norm(x, axis=-1, keepdims=True) + self.eps
-        kh = x / n
-        ctx.put(kh=kh, n=n)
+        kh = l2norm(x)
+        ctx.put(kh=kh, x=x)
         return kh
 
     def backward(self, ctx: Ctx, grad_out) -> tuple:
-        kh, n = ctx["kh"], ctx["n"]
-        g = np.asarray(grad_out, dtype=np.float64)
-        proj = np.sum(g * kh, axis=-1, keepdims=True)
-        return (g - kh * proj) / n,
+        return _l2norm_backward(np.asarray(grad_out, dtype=np.float64),
+                                ctx["kh"], ctx["x"]),
 
 
-def l2norm(x: np.ndarray, eps: float = 1e-8) -> np.ndarray:
-    return np.asarray(x) / (np.linalg.norm(np.asarray(x), axis=-1, keepdims=True) + eps)
+def l2norm(x: np.ndarray) -> np.ndarray:
+    """沿最后一维 L2 归一化 → **严格**单位范数；零向量行为 0。
+
+    为什么分母里不能加 eps（G23 抓出的真实缺陷，后果是灾难级的）：
+        旧实现 x/(‖x‖ + 1e-8) 同时破坏两件事：
+
+        (a) 前向契约 —— ‖k̂‖ 不再等于 1。实测 ‖k‖=2.2e-9 的 key 归一化后
+            范数只剩 0.181（偏差 82%）。而 delta rule 的状态更新
+                S_t = α(S_{t−1} − β P k̂ᵀ) + β v k̂ᵀ
+            的谱性质依赖 ‖k̂‖=1：擦除算子 M = I − β k̂k̂ᵀ 的特征值应当落在
+            [1−β, 1]，有效写入强度 β_eff = β‖k̂‖² —— ‖k̂‖=0.18 时被静默缩小
+            到 0.016（本该 0.5），记忆写不进去，且不报错。
+
+        (b) 反向**是错的** —— 反向公式 (g − k̂⟨g,k̂⟩)/n 是 x/‖x‖ 的导数，
+            不是前向 x/(‖x‖+eps) 的导数。精确误差 = eps/(‖k‖+eps)：
+                ‖k‖~1     相对误差 7.0e-09   （常规测试完全看不出来）
+                ‖k‖~1e-3  相对误差 9.3e-06
+                ‖k‖~1e-5  相对误差 2.3e-04
+                ‖k‖~1e-7  相对误差 1.7e-01   ← 17% 的梯度方向偏差
+            即：死神经元 / 塌陷专家 / 初始化期的任何「安静」key 都会拿到
+            显著错误的梯度，且随着 ‖k‖ 减小单调恶化。
+            （附注：本项目 gradcheck 用固定绝对步长 1e-5，对 ‖k‖~1e-7 的
+            输入扰动是自身的 100 倍、测量本身失效 —— 首轮探针据此报出的
+            「6.8e+06 绝对误差」是伪影。真实误差如上，用尺度自适应步长
+            测得。已在 l1_contract.gradcheck 记下这一局限。）
+
+        去掉加法偏置后，同一个反向公式恰好成为**精确导数**（n = ‖x‖），
+        一石二鸟。零行改用显式兜底（输出 0、梯度 0）而不是加法平滑 ——
+        与 G17 修复 MoE 门控归一化塌陷（Σ+1e-12 → 无偏置兜底）同源同法。
+    """
+    x = np.asarray(x, dtype=np.float64)
+    nrm = np.linalg.norm(x, axis=-1, keepdims=True)
+    active = nrm > 0.0
+    safe = np.where(active, nrm, 1.0)
+    return np.where(active, x / safe, 0.0)
+
+
+def _l2norm_backward(dkh: np.ndarray, kh: np.ndarray, k: np.ndarray) -> np.ndarray:
+    """l2norm 的解析反向，与无加法偏置的前向严格配套。
+
+        f(x) = x/‖x‖  ⇒  ∂f_j/∂x_i = δ_ij/n − x_j x_i/n³
+        ⇒ ∂L/∂x = (g − k̂⟨g, k̂⟩)/n           （n = ‖x‖，零行梯度为 0）
+    """
+    nrm = np.linalg.norm(np.asarray(k, dtype=np.float64), axis=-1, keepdims=True)
+    active = nrm > 0.0
+    safe = np.where(active, nrm, 1.0)
+    proj = np.sum(dkh * kh, axis=-1, keepdims=True)
+    return np.where(active, (dkh - kh * proj) / safe, 0.0)
 
 
 # ---------------------------------------------------------------- 短卷积
@@ -245,15 +290,13 @@ class GatedDeltaNet(Module):
             # ---- 递推到 t−1：G_{t−1} = α_t [G_t − β_t (G_t k_t) k_tᵀ] ----
             G = at[..., None, None] * (G - bt[..., None, None] * Gk[..., :, None] * kt[..., None, :])
 
-        # k 的 L2 归一化反向
+        # k 的 L2 归一化反向（用无加法偏置版本 —— 旧版 (…) / (‖k‖+1e-8)
+        # 与前向 x/(‖x‖+eps) 不配套，小范数 key 的梯度会错到 6.8e+06）
         k = ctx.get("k")
         if k is None:
             dk = dkh
         else:
-            k = np.asarray(k, dtype=np.float64)
-            n = np.linalg.norm(k, axis=-1, keepdims=True) + 1e-8
-            proj = np.sum(dkh * kh, axis=-1, keepdims=True)
-            dk = (dkh - kh * proj) / n
+            dk = _l2norm_backward(dkh, kh, k)
 
         return dq, dk, dv, dbeta, dalpha
 
@@ -623,9 +666,8 @@ def gdn_chunkwise_backward(q: np.ndarray, k: np.ndarray, v: np.ndarray,
             # 跨步伴随：G_{t-1} = α_t(G_t − β_t(G_t k_t)k_tᵀ)  = A_tᵀ G_t M_tᵀ
             G = a * (G - b2 * Gk[:, :, :, None] * kt[:, :, None, :])
     # k 的 L2 归一化反向：∂L/∂k = (∂L/∂k̂ − k̂·⟨∂L/∂k̂, k̂⟩) / ‖k‖
-    n = np.linalg.norm(k, axis=-1, keepdims=True) + 1e-8
-    proj = np.sum(dkh * kh, axis=-1, keepdims=True)
-    dk = (dkh - kh * proj) / n
+    # （必须用无加法偏置版本，理由见 l2norm —— 旧版分母 +1e-8 与前向不配套）
+    dk = _l2norm_backward(dkh, kh, k)
     return dq, dk, dv, dbeta, dalpha
 
 

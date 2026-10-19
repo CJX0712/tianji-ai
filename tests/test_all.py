@@ -22,7 +22,7 @@ from tianji.l3_primitives import (                          # noqa: E402
     Linear, RMSNorm, RoPE, SwiGLU, CausalAttention, CrossEntropy,
     rope_tables, causal_mask_rect, causal_mask)
 from tianji.l4_deltanet import (        # noqa: E402
-    GatedDeltaNet, CausalConv1D, L2Norm, gdn_parallel, gdn_chunkwise,
+    GatedDeltaNet, CausalConv1D, L2Norm, l2norm, gdn_parallel, gdn_chunkwise,
     gdn_chunkwise_backward, GatedDeltaNetChunkwise)
 from tianji.l5_moe import (                                 # noqa: E402
     MoELayer, LoadBalancer, sigmoid)
@@ -1417,6 +1417,80 @@ def test_crossentropy_all_ignored_targets():
     grad = CrossEntropy().backward(ctx, 1.0)[0]
     assert loss == 0.0
     assert np.all(grad == 0.0) and np.isnan(grad).sum() == 0
+
+
+# ============================================================ GDN 归一化（G23）
+
+def test_l2norm_unit_norm_contract():
+    """L1（G23 抓出的真实缺陷）：‖k̂‖ == 1 对任意 ‖k‖>0 成立。
+
+    缺陷版分母加 1e-8：‖k‖=2.2e-9 时归一化后范数只剩 0.181（偏差 82%），
+    delta rule 的有效写入强度 β‖k̂‖² 被静默缩小到 0.016（本该 0.5）。
+    """
+    g = rng(21)
+    for s in (1.0, 1e-1, 1e-3, 1e-6, 1e-9, 1e-12):
+        x = g.standard_normal((3, 2, 4))
+        x = x / np.linalg.norm(x, axis=-1, keepdims=True) * s
+        kk = l2norm(x)
+        assert np.abs(np.linalg.norm(kk, axis=-1) - 1.0).max() < 1e-13, f"‖k‖={s}"
+
+
+def test_l2norm_zero_vector():
+    """零向量 → 零输出、无 NaN（不做加法平滑兜底）。"""
+    z = l2norm(np.zeros((2, 2, 4)))
+    assert np.all(z == 0.0) and np.isnan(z).sum() == 0
+
+
+def test_l2norm_gradient_scale_aware():
+    """L2：尺度自适应中心差分（gradcheck 固定步长在小量级下测量失效）。
+
+    缺陷版（前向 x/(‖x‖+eps) 配 x/‖x‖ 的导数）相对误差 = eps/(‖k‖+eps)，
+    ‖k‖=1e-7 时达 17%。
+    """
+    g = rng(22)
+    for s in (1.0, 1e-3, 1e-5, 1e-7):
+        x = g.standard_normal((4,))
+        x = x / np.linalg.norm(x) * s
+        gg = g.standard_normal((4,))
+        kh = l2norm(x)
+        n = np.linalg.norm(x)
+        analytic = (gg - kh * float(np.sum(gg * kh))) / n
+        # 相对步长的中心差分
+        num = np.zeros_like(x)
+        for i in range(x.size):
+            h = 1e-5 * max(abs(x[i]), float(np.linalg.norm(x)) / x.size, 1e-300)
+            xp, xm = x.copy(), x.copy()
+            xp[i] += h
+            xm[i] -= h
+            num[i] = (float(np.sum(gg * l2norm(xp)))
+                      - float(np.sum(gg * l2norm(xm)))) / (2 * h)
+        rel = np.abs(analytic - num).max() / (np.abs(num).max() + 1e-300)
+        assert rel < 1e-8, f"‖k‖={s}: 梯度相对误差 {rel:.2e}"
+
+
+def test_gdn_three_paths_boundary_gates():
+    """L3：三路径在 α,β 边界与极端 ‖k‖ 下仍逐位一致。"""
+    g = rng(23)
+    B, H, T, D = 2, 2, 8, 4
+    q = g.standard_normal((B, H, T, D))
+    v = g.standard_normal((B, H, T, D))
+    worst = 0.0
+    for av in (0.0, 0.5, 1.0):
+        for bv in (0.0, 0.5, 1.0):
+            for ks in (1.0, 1e-7, 1e8):
+                k = g.standard_normal((B, H, T, D)) * ks
+                al = np.full((B, H, T), av)
+                be = np.full((B, H, T), bv)
+                of = GatedDeltaNet().forward(Ctx(), q, k, v, be, al)
+                op = gdn_parallel(q, k, v, be, al)
+                assert np.all(np.isfinite(of)) and np.all(np.isfinite(op))
+                for ch in (1, 3, T, T + 5):
+                    oc = gdn_chunkwise(q, k, v, be, al, chunk=ch)
+                    assert np.all(np.isfinite(oc))
+                    den = np.abs(of).max() + 1e-30
+                    worst = max(worst, np.abs(op - of).max() / den,
+                                np.abs(oc - of).max() / den)
+    assert worst < 1e-10, f"三路径在边界发散: {worst:.2e}"
 
 
 # ============================================================ 门禁
