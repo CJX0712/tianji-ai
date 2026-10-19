@@ -143,6 +143,16 @@
                     (c) L3 三条算法路径（递推/并行扫描/chunkwise）在
                     α,β ∈ {0,1} 全部边界组合 + 极小/极大 ‖k‖ 下仍逐位
                     一致（≤4.4e-16），chunk 取 1/T/T+5/非整除均成立
+    G24 基准熵下界    E1-E3 全部机检：(a) 熵下界自洽 —— 2 阶马尔可夫源熵率 H
+                    由两套独立算法（解析平稳分布法 H_A 与 oracle 交叉熵法
+                    H_B）算出且互相一致（差 < 5e-3），0<H<log(vocab) 成立，
+                    证明「降到多少才算学会」的判据是被算出来的、不是编的；
+                    (b) 损失不破熵下界 —— 未训练模型验证交叉熵 ≥ H（若 loss
+                    算出 sub-entropy 值即说明损失函数有 bug，本护栏拦截）；
+                    (c) 基准诚实性 —— 读 bench/results/bench.json，断言各配置
+                    learned fraction = (uniform−loss)/(uniform−H) 全部 ≤ 1.0
+                    （即没有任何配置突破熵下界；当前基准均远未学会，见
+                    BENCHMARKS.md 诚实修订）
 """
 
 from __future__ import annotations
@@ -1675,6 +1685,59 @@ def run_all_gates(seed: int = 0, steps: int = 60, verbose: bool = True) -> GateR
         f"× chunk∈{{1,3,T,T+5}} 共 108 组组合最大差 {l3_worst:.2e}、全有限="
         f"{l3_finite}",
         l1=l1_worst, l1_zero=l1_zero, l2=l2_worst, l3=l3_worst, l3_finite=l3_finite)
+    R.results[-1].seconds = time.time() - t0
+
+    # ---- G24 · 基准熵下界（可机检） ----
+    t0 = time.time()
+    from tianji.data import markov_entropy_rate, markov_tokens
+    from tianji.model import TianjiConfig, TianjiModel, init_params
+    from tianji.l7_train import evaluate  # DataLoader 用模块级导入，避免遮蔽 train_once 的闭包
+    er = markov_entropy_rate(vocab=64, seed=0, n_sample=200_000)
+    H = float(er["H"])
+    # E1 · 熵率自洽：两套独立算法一致 ⇒ H 是被算出来的，不是编的
+    # E2 · 损失不破熵下界：loss 函数健全性护栏（任何模型 CE ≥ H）
+    cfg0 = TianjiConfig(vocab_size=64, d_model=32, n_layers=2, n_heads=2,
+                        n_kv_heads=1, d_latent_q=16, d_latent_kv=12, d_rope=4,
+                        d_ff=64, d_ff_expert=32, n_experts=1, moe_top_k=1,
+                        max_len=128, mtp_depth=1)
+    m0 = TianjiModel(cfg0, init_params(cfg0, seed=0))
+    vld0 = DataLoader(markov_tokens(1500, 64, 7), seq_len=32, batch_size=8, seed=999)
+    ce0 = float(evaluate(m0, vld0, n_batch=12))
+    guard_ok = bool(np.isfinite(ce0) and ce0 >= 0.0 and ce0 >= H - 1e-6)
+    # E3 · 基准诚实性：读 bench.json，断言各配置 learned fraction ≤ 1（不破熵下界）
+    import json as _json, os as _os
+    bj = _os.path.join(_os.path.dirname(__file__), "..", "bench", "results", "bench.json")
+    if _os.path.exists(bj):
+        with open(bj, encoding="utf-8") as f:
+            bench = _json.load(f)
+        logv = er["log_vocab"]
+
+        def _lf(vl):
+            return (logv - vl) / (logv - H)   # 1.0 = 达到熵下界
+
+        rows = []
+        for sec in ("architecture", "layout", "optimizer"):
+            for r in bench.get(sec, []):
+                if "val_loss" in r and np.isfinite(r["val_loss"]):
+                    rows.append((r.get("name", "?"), float(r["val_loss"]), _lf(r["val_loss"])))
+        max_lf = max((x[2] for x in rows), default=0.0) if rows else 0.0
+        over = any(x[2] > 1.0 + 1e-9 for x in rows)
+        honesty_detail = (f"读 bench.json：{len(rows)} 个配置的最大 learned fraction="
+                         f"{max_lf:.3f}（=(uniform−模型)/(uniform−floor)，1.0=达到熵下界）；"
+                         f"全部 ≤ 1 即「没有任何配置突破熵下界」；当前基准均远未学会"
+                         f"（见 BENCHMARKS.md）")
+    else:
+        max_lf, over = 0.0, False
+        honesty_detail = ("bench/results/bench.json 不存在，跳过读取（门禁仍守着 H 自洽"
+                         f"与不破下界）；运行 `python bench/run_bench.py` 后可机检 learned fraction")
+    ok24 = bool(er["consistent"] and guard_ok and not over)
+    add("基准熵下界", ok24,
+        f"E1 熵率自洽：H={H:.4f} nats（解析平稳分布 H_A={er['H_analytic']:.4f} 与 "
+        f"oracle 交叉熵 H_B={er['H_oracle']:.4f} 差 {er['abs_diff']:.2e}<{er['tol']:.0e}），"
+        f"0<H<log(vocab)={er['log_vocab']:.4f}；E2 损失不破下界：未训练模型验证 CE "
+        f"{ce0:.4f} ≥ H（差 {ce0 - H:+.4f}，sub-entropy 即 bug，本护栏拦截）；E3 {honesty_detail}",
+        H=H, H_A=float(er["H_analytic"]), H_B=float(er["H_oracle"]), diff=float(er["abs_diff"]),
+        ce0=ce0, max_learned_fraction=float(max_lf))
     R.results[-1].seconds = time.time() - t0
 
     return R

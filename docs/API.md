@@ -431,12 +431,13 @@ from tianji import save_checkpoint, load_checkpoint, checkpoint_info, Checkpoint
 ## 数据
 
 ```python
-from tianji import TINY_TALE, default_corpus, markov_tokens
+from tianji import TINY_TALE, default_corpus, markov_tokens, markov_entropy_rate
 ```
 
 - `TINY_TALE` —— 极小的中英混合文本
 - `default_corpus()` —— 默认训练语料（约 93.5KB，71280 字符）
-- `markov_tokens(n, vocab, seed=0, order=2)` —— 确定性合成马尔可夫序列（基准用，有明确熵下界）
+- `markov_tokens(n, vocab, seed=0, order=2)` —— 确定性合成马尔可夫序列（基准语料源；与 `bench/run_bench.py` 同源，已去重）
+- `markov_entropy_rate(vocab=64, seed=0, order=2, n_sample=200_000, tol=5e-3)` —— 计算该马尔可夫源的**熵率下界 H**，返回 dict（`H / H_analytic / H_oracle / abs_diff / consistent` 等）。**两套独立算法互相印证**（解析平稳分布法 + oracle 交叉熵法），是「降到多少才算学会」的可机检判据，由门禁 G24 守着
 
 全部离线，无任何下载。
 
@@ -447,8 +448,8 @@ from tianji import TINY_TALE, default_corpus, markov_tokens
 ```python
 from tianji import run_all_gates, GateReport, GateResult
 rep = run_all_gates(seed=0, steps=40)
-print(rep.table())        # G1..G10 的 PASS/FAIL 与实测值
-rep.all_green             # 是否 23/23
+print(rep.table())        # G1..G24 的 PASS/FAIL 与实测值
+rep.all_green             # 是否 24/24
 ```
 
 ---
@@ -456,7 +457,7 @@ rep.all_green             # 是否 23/23
 ## 命令行
 
 ```bash
-python -m tianji.cli gates      # 23 道交付门禁
+python -m tianji.cli gates      # 24 道交付门禁
 python -m tianji.cli test       # 模块梯度检验冒烟
 python -m tianji.cli bench      # 完整基准
 python -m tianji.cli microops   # 微指令统计（--show 列出全部家族）

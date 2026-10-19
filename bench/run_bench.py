@@ -3,6 +3,7 @@
 运行： python bench/run_bench.py [--steps N] [--seed S] [--quick]
 
 对比维度：
+    B0 熵下界  H（可机检，门禁 G24）—— 任何模型交叉熵 ≥ H
     B1 架构    Hybrid 3:1 (GDN+MLA) / 全注意力 / 全 GDN，等参数量
     B2 布局    interleave（Qwen3-Next） vs edge（Mamba-3）
     B3 优化器  AdamW / Muon / Muon2
@@ -11,9 +12,10 @@
     B6 投机解码 接受率与加速比
 
 诚实声明：
-    - 语料是**确定性合成**的 2 阶马尔可夫，不是真实文本。
+    - 语料是**确定性合成**的 2 阶马尔可夫（:func:`tianji.markov_tokens`），不是真实文本。
       选择合成语料的理由：离线可复现（无需下载），且有明确的熵下界，
-      因此「降到多少才算学会」是可判定的。
+      因此「降到多少才算学会」是可判定的 —— 该下界 H 由
+      :func:`tianji.markov_entropy_rate` 算出并由门禁 G24 机检（见 B0）。
       因此本基准的绝对数字**不可与任何真实语料上的结果横向比较**，
       它只用于**同一实验内不同配置之间的相对比较**。
     - 模型规模在百万参数以下、训练步数在数百量级。
@@ -33,24 +35,13 @@ import numpy as np
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from tianji.model import TianjiConfig, TianjiModel, init_params          # noqa: E402
-from tianji.l0_numerics import spawn_seed, rng                            # noqa: E402
+from tianji.data import (markov_tokens as synth_tokens,                  # noqa: E402
+                         markov_entropy_rate)
 from tianji.l6_optimizer import HybridOptimizer, AdamW, Muon, Muon2       # noqa: E402
 from tianji.l7_train import DataLoader, Trainer, evaluate                 # noqa: E402
 from tianji.l8_infer import (quantize_per_channel, quantize_groupwise,    # noqa: E402
                              dequantize, speculative_decode, generate,
                              TinyDraftGDN)
-
-
-def synth_tokens(n: int, vocab: int, seed: int = 0) -> np.ndarray:
-    g = rng(spawn_seed(seed, "synth"))
-    trans = g.dirichlet(np.ones(vocab) * 0.25, size=(vocab, vocab))
-    out = np.zeros(n, dtype=np.int64)
-    a, b = 0, 1
-    for i in range(n):
-        c = g.choice(vocab, p=trans[a, b])
-        out[i] = c
-        a, b = b, c
-    return out
 
 
 def base_cfg(**kw):
@@ -240,6 +231,18 @@ def main():
     steps = 40 if a.quick else a.steps
 
     print("=" * 68)
+    print("B0 熵下界（可机检 · 门禁 G24）")
+    print("=" * 68)
+    er = markov_entropy_rate(vocab=64, seed=a.seed)
+    print(f"  2 阶马尔可夫源熵率 H = {er['H']:.4f} nats "
+          f"（解析 {er['H_analytic']:.4f} / oracle {er['H_oracle']:.4f}，"
+          f"差 {er['abs_diff']:.2e} < {er['tol']:.0e}）")
+    print(f"  uniform 基线 = log(64) = {er['log_vocab']:.4f} nats；"
+          f"任何模型在该源上的交叉熵 ≥ H（Gibbs 不等式）")
+    print(f"  learned fraction 上限 = (uniform − loss)/(uniform − H) = 1.0")
+    print()
+
+    print("=" * 68)
     print("B1 架构对比")
     print("=" * 68)
     b1 = bench_architecture(steps, a.seed)
@@ -271,6 +274,7 @@ def main():
     print()
 
     out = {"seed": a.seed, "steps": steps,
+           "entropy": er,
            "architecture": b1, "layout": b2, "optimizer": b3,
            "quantization": b4, "cache": b5, "speculative": b6,
            "timestamp": time.strftime("%Y-%m-%d %H:%M:%S")}

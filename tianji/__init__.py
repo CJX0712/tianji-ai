@@ -12,7 +12,7 @@
     L7  训练          调度 / 数据管道 / 梯度累积 / 度量
     L8  推理          KV cache / 量化 / 投机解码
     L9  对齐          DPO / IPO / SimPO / KTO
-    L10 微指令+门禁   1024 条可执行微指令 + 23 道交付门禁
+    L10 微指令+门禁   1024 条可执行微指令 + 24 道交付门禁
 
 快速开始：
     >>> from tianji import TianjiConfig, TianjiModel, init_params
@@ -44,7 +44,7 @@ from .l9_align import (
     seq_logprob, mean_logprob, grad_logprob, Aligner, freeze_copy,
     dpo_terms, ipo_terms, simpo_terms, kto_terms,
 )
-from .data import TINY_TALE, default_corpus, markov_tokens
+from .data import TINY_TALE, default_corpus, markov_tokens, markov_entropy_rate
 from .l10_microops import MICROOPS, FAMILIES, FAMILY_KIND, run_all as run_microops
 from .model import TianjiConfig, TianjiModel, init_params, build_layer_layout
 from .persist import save_checkpoint, load_checkpoint, checkpoint_info, CheckpointError
@@ -82,7 +82,7 @@ __all__ = [
     # L10
     "MICROOPS", "FAMILIES", "FAMILY_KIND", "run_microops",
     # 数据与持久化
-    "TINY_TALE", "default_corpus", "markov_tokens",
+    "TINY_TALE", "default_corpus", "markov_tokens", "markov_entropy_rate",
     "save_checkpoint", "load_checkpoint", "checkpoint_info", "CheckpointError",
     # 模型与门禁
     "TianjiConfig", "TianjiModel", "init_params", "build_layer_layout",
