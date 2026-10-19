@@ -216,6 +216,21 @@ class TianjiModel:
                 cache: dict | None = None, pos: int = 0):
         cfg, P = self.cfg, self.P
         B, T = tokens.shape
+        # token 范围守卫（G21 抓出的静默损坏）：负索引会被 numpy 花式索引
+        # 静默回绕到词表末行 —— 实测全 -1 输入 loss==0（模型「完美学会」
+        # 垃圾数据）；越界 token 则在 embedding 索引深处 IndexError。
+        # 两者都不如入口处一句带上下文的 ValueError。开销 O(N)，相对
+        # forward 的 O(N·d²) 矩阵乘可忽略。
+        v = cfg.vocab_size
+        if tokens.size and (int(tokens.min()) < 0 or int(tokens.max()) >= v):
+            raise ValueError(
+                f"token 越界: 合法范围 [0, {v})，实测 [{int(tokens.min())}, "
+                f"{int(tokens.max())}]（负索引会被 numpy 静默回绕，绝不放行）")
+        if targets is not None and targets.size and (
+                int(targets.min()) < 0 or int(targets.max()) >= v):
+            raise ValueError(
+                f"target token 越界: 合法范围 [0, {v})，实测 "
+                f"[{int(targets.min())}, {int(targets.max())}]")
         rec: list[dict] = []
         self._rec = rec
         x = P["tok_emb"][tokens].copy()

@@ -28,7 +28,8 @@ from tianji.l5_moe import (                                 # noqa: E402
     MoELayer, LoadBalancer, sigmoid)
 from tianji.l6_optimizer import (Muon, Muon2, AdamW, HybridOptimizer,  # noqa: E402
                               orthogonalization_quality)
-from tianji.l7_train import cosine_schedule, wsd_schedule, DataLoader   # noqa: E402
+from tianji.l7_train import (cosine_schedule, wsd_schedule, DataLoader,  # noqa: E402
+                             Trainer)
 from tianji.l8_infer import (                               # noqa: E402
     quantize_per_channel, quantize_groupwise, dequantize, speculative_decode)
 from tianji.l10_microops import MICROOPS, FAMILIES, run_all as micro_all  # noqa: E402
@@ -1164,6 +1165,133 @@ def test_default_corpus_size_claim():
     c = default_corpus()
     kb = len(c.encode("utf-8")) / 1024
     assert 90 < kb < 100, f"corpus 大小漂移: {kb:.1f}KB"
+
+
+# ============================================================ 数据管道（G21）
+
+def test_dataloader_rejects_short_data():
+    """D1（G21 抓出的静默损坏）：数据过短必须构造期 ValueError。
+
+    缺陷版 max(n,1) 静默钳制 —— len==T 时 x 全量、y 短一位，
+    batch 形状悄悄错位却不报错。
+    """
+    with pytest.raises(ValueError):
+        DataLoader(np.arange(10), seq_len=10, batch_size=2)
+    with pytest.raises(ValueError):
+        DataLoader(np.arange(5), seq_len=10, batch_size=2)
+
+
+def test_dataloader_rejects_bad_seq_and_batch():
+    with pytest.raises(ValueError):
+        DataLoader(np.arange(50), seq_len=0, batch_size=2)
+    with pytest.raises(ValueError):
+        DataLoader(np.arange(50), seq_len=4, batch_size=0)
+    with pytest.raises(ValueError):
+        DataLoader(np.arange(50), seq_len=4, batch_size=-1)
+
+
+def test_dataloader_edge_len_eq_seq_plus_one():
+    """边界合法：len==T+1 恰有一个窗口，y 是 x 右移一位。"""
+    ld = DataLoader(np.arange(11), seq_len=10, batch_size=2, seed=0)
+    x, y = ld.batch()
+    assert x.shape == (2, 10) and y.shape == (2, 10)
+    assert np.all(y[:, :-1] == x[:, 1:])
+
+
+def test_dataloader_alignment_and_slice_fingerprint():
+    data = np.arange(2, 400)
+    ld = DataLoader(data, seq_len=8, batch_size=16, seed=3)
+    x, y = ld.batch()
+    assert np.all(y[:, :-1] == x[:, 1:])
+    # 同 seed 重放同 starts，每行必须来自连续切片
+    starts = np.random.default_rng(3).integers(0, len(data) - 9, size=16)
+    for i, s in enumerate(starts):
+        assert np.array_equal(data[s:s + 8], x[i])
+        assert np.array_equal(data[s + 1:s + 9], y[i])
+
+
+def test_dataloader_determinism():
+    data = np.arange(500)
+    a = DataLoader(data, 16, 4, seed=7).batch()
+    b = DataLoader(data, 16, 4, seed=7).batch()
+    c = DataLoader(data, 16, 4, seed=8).batch()
+    assert np.array_equal(a[0], b[0]) and np.array_equal(a[1], b[1])
+    assert not np.array_equal(a[0], c[0])
+
+
+def test_forward_rejects_out_of_range_tokens():
+    """D2（G21 抓出的静默损坏）：负 token 被 numpy 静默回绕到词表末行。
+
+    缺陷版实测全 -1 输入 loss==0（模型「完美学会」垃圾数据）。
+    """
+    cfg = TianjiConfig(vocab_size=64, d_model=32, n_layers=2,
+                       n_heads=2, n_kv_heads=1)
+    m = TianjiModel(cfg, init_params(cfg, seed=0))
+    with pytest.raises(ValueError):
+        m.forward(np.full((1, 4), -1, dtype=np.int64))
+    with pytest.raises(ValueError):
+        m.forward(np.full((1, 4), 999, dtype=np.int64))
+    with pytest.raises(ValueError):          # targets 越界同样拒绝
+        m.forward(np.zeros((1, 4), dtype=np.int64),
+                  np.full((1, 4), 64, dtype=np.int64))
+    out = m.forward(np.array([[1, 2, 3]], dtype=np.int64),
+                    np.array([[2, 3, 4]], dtype=np.int64))
+    assert np.isfinite(out["loss"])
+
+
+def test_scheduler_endpoints_and_monotonic():
+    """T1（l7_train 原宣称「门禁复检」但门禁不存在，G21 补齐）。"""
+    for total, warm, lr in [(100, 10, 0.02), (37, 1, 0.05), (50, 50, 0.03),
+                            (200, 40, 0.01), (60, 0, 0.02)]:
+        cs = [cosine_schedule(s, total, warm, lr) for s in range(total + 1)]
+        ws = [wsd_schedule(s, total, warm, lr) for s in range(total + 1)]
+        assert abs(cs[total]) < 1e-12 and abs(ws[total]) < 1e-12
+        if warm and warm < total:
+            assert abs(cs[warm] - lr) < 1e-12
+            assert abs(cs[warm - 1] - lr) < 1e-12
+            assert abs(ws[warm] - lr) < 1e-12
+        for s in range(warm):                # warmup 线性
+            assert abs(cs[s] - lr * (s + 1) / max(warm, 1)) < 1e-15
+        for seq in (cs, ws):                 # warmup 后单调不增
+            assert all(seq[i + 1] <= seq[i] + 1e-15 for i in range(warm, total))
+
+
+def test_gradient_accumulation_equivalence():
+    """G21(g)：accum=k 一次 step 的梯度 == 同 seed 重放 k batch 手动平均。"""
+
+    class _NoopOpt:
+        def __init__(self):
+            class _S:
+                lr = 0.0
+            self.muon, self.adam = _S(), _S()
+            self.last_grad_norm = 0.0
+            self.captured = None
+
+        def step(self, params, grads):
+            self.captured = {k: v.copy() for k, v in grads.items()}
+
+    cfg = TianjiConfig(vocab_size=64, d_model=32, n_layers=2,
+                       n_heads=2, n_kv_heads=1)
+    data = np.random.default_rng(2).integers(0, 64, size=400)
+    K = 3
+
+    m_b = TianjiModel(cfg, init_params(cfg, seed=2))
+    tr_b = Trainer(m_b, _NoopOpt(), DataLoader(data, 8, 2, seed=5),
+                   total_steps=1, warmup=0, lr_max=0.0, accum=K)
+    tr_b.step(0)
+    g_acc = tr_b.opt.captured
+
+    m_a = TianjiModel(cfg, init_params(cfg, seed=2))
+    tr_a = Trainer(m_a, _NoopOpt(), DataLoader(data, 8, 2, seed=5),
+                   total_steps=K, warmup=0, lr_max=0.0, accum=1)
+    g_sum = None
+    for _ in range(K):
+        tr_a.step(0)
+        c = tr_a.opt.captured
+        g_sum = {k: v.copy() for k, v in c.items()} if g_sum is None else \
+            {k: g_sum[k] + v for k, v in c.items()}
+    for k in g_acc:
+        assert np.allclose(g_acc[k], g_sum[k] / K, atol=1e-12)
 
 
 # ============================================================ 门禁

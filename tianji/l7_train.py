@@ -67,12 +67,27 @@ class DataLoader:
     为什么用「随机起点 + 连续切片」而不是随机采样单个 token：
     语言建模需要连续的上下文，随机单点采样会破坏序列结构，
     让模型只学到边际分布。
+
+    构造期响亮校验（G21 抓出的静默损坏，修复）：
+        数据过短时旧实现 `max(n, 1)` 静默钳制 —— len==T 时 x 全量、
+        y 短一位，batch 形状悄悄错位却不报错；seq_len=0 产出空 batch。
+        这类输入只会让训练静默污染，必须在构造处一声响亮 ValueError。
     """
 
     def __init__(self, tokens: np.ndarray, seq_len: int, batch_size: int, seed: int = 0):
         self.data = np.asarray(tokens, dtype=np.int64)
         self.T = int(seq_len)
         self.B = int(batch_size)
+        if self.T < 1:
+            raise ValueError(f"seq_len 必须 >= 1，得到 {seq_len}")
+        if self.B < 1:
+            raise ValueError(f"batch_size 必须 >= 1，得到 {batch_size}")
+        # 至少要能形成一对 (x, y)：x=data[s:s+T], y=data[s+1:s+T+1]
+        # 需要 len >= T+1。len==T+1 时恰有一个合法起点 s=0。
+        if len(self.data) < self.T + 1:
+            raise ValueError(
+                f"token 序列过短: len={len(self.data)} < seq_len+1={self.T + 1}"
+                f"（连一个 (x,y) 训练对都切不出来，训练将静默使用错位 batch）")
         self.rng = np.random.default_rng(seed)
 
     def batch(self) -> tuple[np.ndarray, np.ndarray]:

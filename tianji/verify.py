@@ -93,8 +93,25 @@
                     声明：防失配腐烂，不防同步作恶）；(e) 原子性 —— 模拟
                     meta 写入崩溃，无 tmp 半成品、旧 checkpoint 逐位完好
                     可加载（对齐 safetensors 的 tmp+rename 模式）；(f) 空
-                    参数/怪异参数名/dtype 保持；(g) 保存确定性 + 指纹失配
+                    参数/怪异参数名/dtype 保持；                    (g) 保存确定性 + 指纹失配
                     检出 + 缺失 meta/不存在路径响亮失败
+    G21 数据管道        D1-D4 + T1 全部机检 + 边界对抗：(a) 构造期响亮校验
+                    —— 探针抓出「数据过短时 max(n,1) 静默钳制 → x/y batch
+                    形状悄悄错位（x(2,10) y(2,9)）不报错」的真实缺陷
+                    （已修复：len < seq_len+1 / seq_len<1 / batch_size<1
+                    一律构造期 ValueError）；(b) 边界合法：len==seq_len+1
+                    恰有一个窗口，y==shift(x)；(c) token 范围守卫 —— 探针
+                    抓出「负 token 被 numpy 花式索引静默回绕到词表末行，
+                    实测全 -1 输入 loss==0（模型完美学会垃圾）」的真实缺陷
+                    （已修复：forward 入口校验 [0, vocab_size)，覆盖训练/
+                    评估/推理全部调用方）；(d) y 对齐不变量 + 连续切片
+                    指纹重放；(e) 同 seed 逐位一致/异 seed 不同；
+                    (f) T1 调度器 —— l7_train 原宣称「门禁复检」但门禁
+                    不存在（与 G19 的 N3 同型的宣称-门禁失配），本门禁
+                    补齐：cosine/wsd 端点精确（warmup 斜率、lr_max、
+                    lr_min）+ warmup 后单调不增 + 多参数组合扫描；
+                    (g) 梯度累积等价：accum=k 一次 step 的梯度 ==
+                    同 seed 重放 k batch 的手动平均（确定性重放）
 """
 
 from __future__ import annotations
@@ -1224,6 +1241,174 @@ def run_all_gates(seed: int = 0, steps: int = 60, verbose: bool = True) -> GateR
         w_corrupt=w_corrupt_ok, tamper=tamper_ok, atomic=atomic_ok,
         empty=empty_ok, weird=weird_ok, dtype=dtype_ok, det=det_ok,
         overwrite=ow_ok, missing=miss_ok)
+    R.results[-1].seconds = time.time() - t0
+
+    # ---------------------------------------------------------- G21 数据管道
+    t0 = time.time()
+    from .l7_train import DataLoader as _DL, cosine_schedule as _cos, wsd_schedule as _wsd
+    g21 = rng(spawn_seed(seed, "datapipe"))
+    cfg21 = _Cfg(vocab_size=64, d_model=32, n_layers=2, n_heads=2, n_kv_heads=1)
+    data21 = g21.integers(0, 64, size=400)
+
+    # ---- (a) 构造期响亮校验（D1/D3 复检）
+    guards21 = {
+        "len==T": lambda: _DL(np.arange(10), 10, 2),
+        "len<T": lambda: _DL(np.arange(5), 10, 2),
+        "seq_len=0": lambda: _DL(data21, 0, 2),
+        "batch_size=0": lambda: _DL(data21, 4, 0),
+        "batch_size=-1": lambda: _DL(data21, 4, -1),
+    }
+    guard_ok = True
+    for _n, _fn in guards21.items():
+        try:
+            _fn()
+            guard_ok = False
+        except ValueError:
+            pass
+        except Exception:
+            guard_ok = False
+
+    # ---- (b) 边界合法：len==T+1 恰有一个窗口 + y==shift(x)
+    edge_ok = True
+    try:
+        ld_e = _DL(np.arange(11), 10, 2, seed=0)
+        xe, ye = ld_e.batch()
+        edge_ok = (xe.shape == (2, 10) and ye.shape == (2, 10)
+                   and np.all(ye[:, :-1] == xe[:, 1:]))
+    except Exception:
+        edge_ok = False
+
+    # ---- (c) token 范围守卫（D2 复检：负 token 静默回绕）
+    tok_guard_ok = True
+    try:
+        m21 = TianjiModel(cfg21, init_params(cfg21, seed=0))
+        for _tk in (np.full((1, 4), -1, dtype=np.int64),
+                    np.full((1, 4), 999, dtype=np.int64)):
+            try:
+                m21.forward(_tk, _tk)
+                tok_guard_ok = False
+            except ValueError:
+                pass
+            except Exception:
+                tok_guard_ok = False
+        # targets 越界同样拒绝
+        try:
+            m21.forward(np.zeros((1, 4), dtype=np.int64),
+                        np.full((1, 4), 64, dtype=np.int64))
+            tok_guard_ok = False
+        except ValueError:
+            pass
+        # 正常 token 不受影响
+        _o = m21.forward(np.array([[1, 2, 3]], dtype=np.int64),
+                         np.array([[2, 3, 4]], dtype=np.int64))
+        tok_guard_ok = tok_guard_ok and np.isfinite(_o["loss"])
+    except Exception:
+        tok_guard_ok = False
+
+    # ---- (d) y 对齐不变量 + 连续切片指纹重放
+    align_ok = True
+    try:
+        ld_a = _DL(data21, 8, 16, seed=3)
+        xa, ya = ld_a.batch()
+        align_ok = np.all(ya[:, :-1] == xa[:, 1:])
+        # 确定性重放同 starts，验证每行来自连续切片
+        ld_a2 = _DL(data21, 8, 16, seed=3)
+        starts = np.random.default_rng(3).integers(0, len(data21) - 9, size=16)
+        for i, s in enumerate(starts):
+            if not (np.array_equal(data21[s:s + 8], xa[i])
+                    and np.array_equal(data21[s + 1:s + 9], ya[i])):
+                align_ok = False
+                break
+    except Exception:
+        align_ok = False
+
+    # ---- (e) 确定性
+    d_a = _DL(data21, 16, 4, seed=7).batch()
+    d_b = _DL(data21, 16, 4, seed=7).batch()
+    d_c = _DL(data21, 16, 4, seed=8).batch()
+    det21 = (np.array_equal(d_a[0], d_b[0]) and np.array_equal(d_a[1], d_b[1])
+             and not np.array_equal(d_a[0], d_c[0]))
+
+    # ---- (f) T1 调度器：端点精确 + warmup 线性 + warmup 后单调不增
+    sched_ok = True
+    sched_worst = 0.0
+    for _total, _warm, _lr in [(100, 10, 0.02), (37, 1, 0.05), (50, 50, 0.03),
+                               (200, 40, 0.01), (60, 0, 0.02)]:
+        cs = [_cos(s, _total, _warm, _lr) for s in range(_total + 1)]
+        ws = [_wsd(s, _total, _warm, _lr) for s in range(_total + 1)]
+        sched_worst = max(sched_worst, abs(cs[_total]), abs(ws[_total]))
+        if _warm and _warm < _total:
+            # warmup 末两个点都应精确 == lr_max（cs[warmup-1] 达满幅、
+            # cs[warmup] 进入衰减段起点；warmup==total 时衰减段为空，
+            # cs[total] 由 lr_min 分支接管，单独检查）
+            sched_worst = max(sched_worst, abs(cs[_warm] - _lr),
+                              abs(cs[_warm - 1] - _lr), abs(ws[_warm] - _lr))
+        # warmup 线性：cosine(s) == lr*(s+1)/warmup
+        for _s in range(_warm):
+            if abs(cs[_s] - _lr * (_s + 1) / max(_warm, 1)) > 1e-15:
+                sched_ok = False
+        # warmup 后单调不增
+        for _seq in (cs, ws):
+            if any(_seq[i + 1] > _seq[i] + 1e-15 for i in range(_warm, _total)):
+                sched_ok = False
+    sched_ok = sched_ok and sched_worst < 1e-12
+
+    # ---- (g) 梯度累积等价：accum=k == 同 seed 重放 k batch 手动平均
+    accum_ok = True
+    accum_rel = float("inf")
+    try:
+        class _NoopOpt:
+            def __init__(self):
+                class _S:
+                    lr = 0.0
+                self.muon, self.adam = _S(), _S()
+                self.last_grad_norm = 0.0
+                self.captured = None
+
+            def step(self, params, grads):
+                self.captured = {k: v.copy() for k, v in grads.items()}
+
+        K = 3
+        m_b = TianjiModel(cfg21, init_params(cfg21, seed=2))
+        tr_b = Trainer(m_b, _NoopOpt(), _DL(data21, 8, 2, seed=5),
+                       total_steps=1, warmup=0, lr_max=0.0, accum=K)
+        tr_b.step(0)
+        g_acc = tr_b.opt.captured
+
+        m_a = TianjiModel(cfg21, init_params(cfg21, seed=2))
+        tr_a = Trainer(m_a, _NoopOpt(), _DL(data21, 8, 2, seed=5),
+                       total_steps=K, warmup=0, lr_max=0.0, accum=1)
+        g_sum = None
+        for _ in range(K):
+            tr_a.step(0)
+            c = tr_a.opt.captured
+            g_sum = {k: v.copy() for k, v in c.items()} if g_sum is None else \
+                {k: g_sum[k] + v for k, v in c.items()}
+        g_man = {k: v / K for k, v in g_sum.items()}
+        common = sorted(set(g_acc) & set(g_man))
+        if not common:
+            accum_ok = False
+        else:
+            accum_rel = max(float(np.abs(g_acc[k] - g_man[k]).max()
+                                  / (np.abs(g_man[k]).max() + 1e-30))
+                            for k in common)
+            accum_ok = accum_rel < 1e-10
+    except Exception:
+        accum_ok = False
+
+    ok21 = (guard_ok and edge_ok and tok_guard_ok and align_ok and det21
+            and sched_ok and accum_ok)
+    add("数据管道", ok21,
+        f"D1 构造期守卫（过短/seq_len=0/batch_size<=0 全 ValueError）={guard_ok}"
+        f"（曾静默钳制出 x(2,10) y(2,9) 错位 batch）；边界 len==T+1={edge_ok}；"
+        f"D2 token 范围守卫={tok_guard_ok}（负 token 曾静默回绕，全 -1 输入 "
+        f"loss==0）；D3 y 对齐+切片指纹={align_ok}；D4 确定性={det21}；"
+        f"T1 调度器端点+单调（原宣称无门禁，已补齐）={sched_ok}，"
+        f"端点最大偏差 {sched_worst:.2e}；梯度累积等价 accum=3 "
+        f"{accum_rel:.2e}（<1e-10）={accum_ok}",
+        guards=guard_ok, edge=edge_ok, tok_guard=tok_guard_ok, align=align_ok,
+        det=det21, sched=sched_ok, sched_dev=sched_worst, accum=accum_ok,
+        accum_rel=accum_rel)
     R.results[-1].seconds = time.time() - t0
 
     return R
