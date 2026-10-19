@@ -8,7 +8,7 @@
 
 门禁清单：
     G1  确定性        同 seed 两次运行逐位一致（否则一切实验结论不可信）
-    G2  梯度正确      全模型解析反向 vs 中心差分（抽样参数）
+    G2  梯度正确      各独立原语（Linear/RMSNorm/RoPE/SwiGLU/CausalAttn/CausalConv1D/GatedDeltaNet…）解析反向 vs 中心差分；完整模型端到端反向见 G25
     G3  训练有效      固定步数后训练损失显著下降
     G4  可过拟合      极小数据上能把损失压到很低（证明反向真的在传播）
     G5  微指令        1024 条全部可执行且输出有限
@@ -153,6 +153,12 @@
                     learned fraction = (uniform−loss)/(uniform−H) 全部 ≤ 1.0
                     （即没有任何配置突破熵下界；当前基准均远未学会，见
                     BENCHMARKS.md 诚实修订）
+    G25 全模型反向一致性 完整模型（GDN+MLA+MoE+MTP 装配）解析反向 vs 中心差分
+                    （分层抽样：每张量少量均匀点 + 全局随机点，全参数中心差分
+                    太慢 ≈190s）：G2 只校验各独立原语反向，本门禁补齐把它们装配成
+                    完整 Transformer 后的端到端反向（残差顺序/Pre-Norm/MoE 路由/
+                    MTP 头梯度），抓住「会训练却永远训不好」的阴险接线 bug
+                    （实测最大混合比值 2.5e-03，远小于 1）
 """
 
 from __future__ import annotations
@@ -1738,6 +1744,80 @@ def run_all_gates(seed: int = 0, steps: int = 60, verbose: bool = True) -> GateR
         f"{ce0:.4f} ≥ H（差 {ce0 - H:+.4f}，sub-entropy 即 bug，本护栏拦截）；E3 {honesty_detail}",
         H=H, H_A=float(er["H_analytic"]), H_B=float(er["H_oracle"]), diff=float(er["abs_diff"]),
         ce0=ce0, max_learned_fraction=float(max_lf))
+    R.results[-1].seconds = time.time() - t0
+
+    # ---- G25 · 全模型反向一致性（端到端 gradcheck） ----
+    # 为什么需要：G2 只校验各「独立原语」的反向（Linear/RMSNorm/RoPE/GDN…），
+    # 但 model.py 把这些原语装配成完整 Transformer 时的接线（残差顺序、Pre-Norm
+    # 反传、MoE 路由梯度、MTP 头梯度）从未端到端机检。这类 bug 不会崩、会「训练」，
+    # 只是永远训不好（G23 注释里记录的阴险案例）。本门禁用中心差分对完整模型
+    # 的反向做一次独立裁判，覆盖 GDN + MLA 注意力 + MoE + MTP 四条装配路径。
+    # 全参数中心差分太慢（33k 参数 ≈ 190s），按项目已认可的随机采样原则，只对
+    # 每张量少量均匀点 + 全局随机点抽样，足以抓住任何「全局性」装配 bug。
+    t0 = time.time()
+    from tianji.model import TianjiConfig as _TC, TianjiModel as _TM, init_params as _ip
+    cfg25 = _TC(vocab_size=32, d_model=16, n_layers=2, n_heads=2,
+                n_kv_heads=2, hybrid_ratio=1, mla=True,
+                d_latent_q=8, d_latent_kv=6, d_rope=4,
+                d_ff=24, d_ff_expert=12, n_experts=4, moe_top_k=2,
+                shared_expert=True, moe_every=2, conv_kernel=4,
+                mtp_depth=1, mtp_lambda=0.1, tie_embeddings=True,
+                max_len=64, rope_base=10000.0)
+    P25 = _ip(cfg25, seed=seed)
+    m25 = _TM(cfg25, P25)
+    rg25 = np.random.default_rng(seed + 77)
+    x25 = rg25.integers(0, cfg25.vocab_size, size=(2, 8))
+    y25 = rg25.integers(0, cfg25.vocab_size, size=(2, 8))
+    # 解析反向（先算，确保 _tail/_rec 来自原始 P25）
+    m25.P = P25
+    o25 = m25.forward(x25, y25)
+    G25 = m25.backward()
+    assert o25["loss"] is not None
+    # 数值反向：中心差分
+    eps25 = 1e-5
+    tol25 = 1e-5
+    gscale25 = max((float(np.abs(v).max()) for v in G25.values()), default=1.0)
+    atol25 = 1e-7 * max(gscale25, 1e-6)
+    Pw25 = {k: v.copy() for k, v in P25.items()}   # 工作副本，绝不污染 P25/G25
+    rs25 = np.random.default_rng(seed + 12345)
+    samples25 = []
+    for nm, arr in P25.items():                      # 每张量少量均匀点：保证逐张量覆盖
+        n = arr.reshape(-1).size
+        k = min(6, n)
+        idx = (np.linspace(0, n - 1, k).astype(int) if n > k
+               else np.arange(n))
+        for j in idx:
+            samples25.append((nm, int(j)))
+    alln25 = list(P25.keys())
+    for _ in range(120):                             # 全局随机点：提高跨张量命中率
+        nm = alln25[rs25.integers(0, len(alln25))]
+        samples25.append((nm, int(rs25.integers(0, P25[nm].size))))
+    worst25 = 0.0
+    info25 = None
+    for (nm, j) in samples25:
+        flat = Pw25[nm].reshape(-1)
+        old = flat[j]
+        flat[j] = old + eps25
+        m25.P = Pw25
+        lp = float(m25.forward(x25, y25)["loss"])
+        flat[j] = old - eps25
+        lm = float(m25.forward(x25, y25)["loss"])
+        flat[j] = old
+        num = (lp - lm) / (2 * eps25)
+        ana = float(G25[nm].reshape(-1)[j])
+        denom = atol25 + tol25 * abs(num)
+        ratio = abs(ana - num) / denom
+        if ratio > worst25:
+            worst25 = ratio
+            info25 = (nm, j, ana, num, ratio)
+    m25.P = P25
+    ok25 = worst25 <= 1.0
+    add("全模型反向一致性", ok25,
+        f"完整模型（GDN+MLA+MoE+MTP 装配）解析反向 vs 中心差分：抽样 "
+        f"{len(samples25)} 条目最大混合比值 {worst25:.2e}（判据 |a−n|≤atol+rtol·|n|，"
+        f"≤1 即过；最差 {info25[0]}[{info25[1]}] 解析 {info25[2]:.3e} vs 数值 "
+        f"{info25[3]:.3e}）—— 证明 model.py 的残差/Pre-Norm/MoE/MTP 接线反向正确",
+        worst_ratio=float(worst25), n_samples=len(samples25))
     R.results[-1].seconds = time.time() - t0
 
     return R

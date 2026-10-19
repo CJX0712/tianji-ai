@@ -103,7 +103,7 @@ the quick brown fox. to be or not to be,
 | **L7** | 训练 | 余弦 / WSD 调度、梯度累积、梯度裁剪、bits-per-byte 度量 |
 | **L8** | 推理 | KV 状态缓存、per-channel INT8 / group-wise INT4、MTP 投机解码 |
 | **L9** | 对齐 | DPO / IPO / SimPO / KTO，统一走 `backward(g_logits=...)` 入口 |
-| **L10** | 微指令 + 门禁 | **1024 条可执行微指令**（32 家族 × 32）+ 24 道交付门禁 |
+| **L10** | 微指令 + 门禁 | **1024 条可执行微指令**（32 家族 × 32）+ 25 道交付门禁 |
 
 完整推导与逐层详解见 [ARCHITECTURE.md](ARCHITECTURE.md)。
 
@@ -147,7 +147,8 @@ Pre-RMSNorm → Mixer(GDN 或 MLA) → 残差 → Pre-RMSNorm → FFN(MoE 或 De
 | G21 数据管道 | D1-D4+T1 全机检 + 边界对抗：构造期响亮校验（曾抓出数据过短时 max(n,1) 静默钳制 → x/y batch 形状悄悄错位）、token 范围守卫（曾抓出负 token 被 numpy 静默回绕到词表末行——实测全 -1 输入 loss==0，模型「完美学会」垃圾）、y 对齐+切片指纹重放、确定性、T1 调度器端点+单调（l7_train 原宣称「门禁复检」但门禁不存在——与 G19 的 N3 同型宣称失配，已补齐）、梯度累积等价 accum=k==同 seed 重放 k batch 手动平均（逐位一致） | 0 失败 |
 | G22 原语不变性 | P3-P6 首次全部机检（宣称「门禁复检」但 4 条全无，已补齐）+ 边界守卫：RoPE 保范（含 20000 长度外推、1e-6~1e6 量级，1.63e-16）、相对位置性质（带非恒真性对照：位置差使内积变化 4.02e+00，否则恒等 RoPE 也能骗过门禁）、因果性（扰动未来不影响过去，0.00e+00）、注意力行和（4 组 GQA 组合，2.22e-16）；曾抓出「causal_mask_rect(Tq>Tk) 全 -inf 行 → softmax 0/0 → attention 静默 NaN 16/40」与「rope_tables 奇数维拼出 dim−1 表且构造阶段不报错」两个真实缺陷；P2「RMSNorm 输出 RMS 恒为 1」证伪（eps=1e-8 平滑项致偏差 2.67e-08），修正为精确闭式命题而非放宽阈值 | 0 失败 |
 | G23 GDN 归一化 | L1-L3 全部机检：**l2norm 单位范数契约** ‖k̂‖==1 对任意 ‖k‖（含 1e-12）成立、零向量→零输出——曾因分母 +1e-8 使 ‖k̂‖ 只剩 0.181（偏差 82%，delta rule 有效写入强度 β‖k̂‖² 被静默缩小到 0.016）；**尺度自适应梯度检验**（gradcheck 固定步长 1e-5 对 ‖k‖~1e-7 输入测量本身失效，已记入 l1_contract 局限）——同一公式配旧前向的相对误差 = eps/(‖k‖+eps)，‖k‖=1e-7 时达 17%；**三路径边界等价** α,β∈{0,0.5,1} × ‖k‖∈{1,1e-7,1e8} × chunk∈{1,3,T,T+5} 共 108 组，最大差 3.06e-16 | 0 失败 |
-| G24 基准熵下界 | E1 熵率自洽（2 阶马尔可夫源 H 由解析平稳分布法与 oracle 交叉熵法两套独立算法算出，差<5e-3，0<H<log(vocab)）+ E2 损失不破下界护栏（未训练模型验证 CE ≥ H，sub-entropy 即 loss bug）+ E3 基准诚实性（读 bench.json 断言各配置 learned fraction ≤ 1，本基准最大 −0.017 即无任何配置学会语料，见 BENCHMARKS.md 诚实结论） | H=3.0356 nats |
+| G24 基准熵下界 | E1 熵率自洽（2 阶马尔可夫源 H 由解析平稳分布法与 oracle 交叉熵法两套独立算法算出，差<5e-3，0<H<log(vocab)）+ E2 损失不破下界护栏（未训练模型验证 CE ≥ H，sub-entropy 即 loss bug）+ E3 基准诚实性（读 bench.json 断言各配置 learned fraction ≤ 1，本基准最大 −0.005 即无任何配置学会语料，见 BENCHMARKS.md 诚实结论） | H=3.0356 nats |
+| G25 全模型反向一致性 | 完整模型（GDN+MLA+MoE+MTP 装配）解析反向 vs 中心差分：抽样 336 条目最大混合比值 2.49e-03（判据 \|a−n\|≤atol+rtol·\|n\|，≤1 即过）—— G2 只校验独立原语反向，本门禁补齐 model.py 把它们装配成完整 Transformer 后的端到端反向（残差顺序/Pre-Norm/MoE 路由/MTP 头梯度），抓住「会训练却永远训不好」的阴险接线 bug | 2.49e-03 |
 
 **门禁的态度：失败就如实报失败，不允许放宽阈值凑绿。**
 
@@ -174,7 +175,7 @@ Pre-RMSNorm → Mixer(GDN 或 MLA) → 残差 → Pre-RMSNorm → FFN(MoE 或 De
 | A12 | 推理吞吐 | > 50 tok/s | **465 tok/s** |
 | A13 | 运行时依赖 | == 1 | **`['numpy']`** |
 | A14 | 单元测试 | 41/41 | **41/41** |
-| A15 | 交付门禁 | 24/24 | **24/24** |
+| A15 | 交付门禁 | 25/25 | **25/25** |
 | A16 | 断网可运行 | 0 处网络依赖 | **0** |
 
 三条判据的设定依据（A3 为何是 10%、A7 为何用权重误差、A8 为何放宽到 15%）
@@ -204,7 +205,7 @@ python scripts/quickstart.py          # 最小示例，约 10 秒
 2. 模型   4 层 布局=LLLA (A=MLA, L=GatedDeltaNet)，参数 252,032
 4. 训练   30 步 2.4s，loss 6.8636 -> 0.2036
 6. 生成   结果='the quick brown fox jumps over the lazy dog. ...'
-7. 门禁   24/24 通过
+7. 门禁   25/25 通过
 ✅ 全部通过
 ```
 
@@ -251,7 +252,7 @@ make verify-all        # 测试 + 门禁 + 最小示例（交付自查）
 
 ```bash
 docker build -t tianji:latest .
-docker run --rm tianji:latest gates      # 跑 24 道门禁
+docker run --rm tianji:latest gates      # 跑 25 道门禁
 docker run --rm tianji:latest test       # 跑 95 个测试
 
 docker compose run --rm tianji train     # 训练，产物落在 ./runs
@@ -290,7 +291,7 @@ python bench/run_bench.py --steps 120 --seed 0     # 约 2 分钟，写 bench/re
 ```bash
 make help          # 查看全部目标
 make test          # 95 个单元测试
-make gates         # 24 道交付门禁
+make gates         # 25 道交付门禁
 make bench         # 完整基准
 make quickstart    # 最小示例
 make train         # 训练
@@ -367,7 +368,7 @@ NumPy 2.5.4 纯 CPU、合成 2 阶马尔可夫语料（vocab=64）、d_model=64 
 | 训练 | ✅ CPU 可训 | ✅ GPU | ❌ | ✅ GPU |
 | 量化 / 投机解码 | ✅ | ❌ | ✅ | ❌ |
 | 对齐（DPO 等） | ✅ | ❌ | ❌ | ❌ |
-| **可证门禁** | **✅ 24 道** | ❌ | ❌ | 部分 |
+| **可证门禁** | **✅ 25 道** | ❌ | ❌ | 部分 |
 | 吞吐 | 低（NumPy CPU） | 高 | 极高 | 极高 |
 
 **诚实的结论**：本项目**不追求吞吐**。它的对标对象是「正确性可独立验证的研究级实现」，
@@ -471,7 +472,7 @@ tianji-ai/
 │   ├── model.py               3:1 混合模型组装
 │   ├── persist.py             checkpoint 保存/加载：sha256+指纹校验、路径规范化、原子落盘
 │   ├── data.py                内置离线语料
-│   ├── verify.py              24 道交付门禁
+│   ├── verify.py              25 道交付门禁
 │   └── cli.py                 命令行入口
 ├── scripts/
 │   ├── reproduce.sh             一键复现（Linux / macOS，无需 Docker）
