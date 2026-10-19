@@ -16,7 +16,8 @@ import numpy as np
 
 from .l0_numerics import rng, spawn_seed
 
-__all__ = ["TINY_TALE", "default_corpus", "markov_tokens"]
+__all__ = ["TINY_TALE", "default_corpus", "markov_tokens",
+           "markov_entropy_rate", "markov_transitions", "markov_train_val"]
 
 
 TINY_TALE = (
@@ -149,3 +150,50 @@ def markov_entropy_rate(vocab: int = 64, seed: int = 0, order: int = 2,
         "consistent": consistent,
         "tol": float(tol),
     }
+
+
+def markov_transitions(vocab: int, seed: int = 0, order: int = 2) -> np.ndarray:
+    """返回 order 阶马尔可夫源的**转移矩阵**（与 :func:`markov_tokens` /
+    :func:`markov_entropy_rate` 完全同源：同一 ``spawn_seed(seed, "synth")`` 抽取）。
+
+    ``order=2`` → 形状 ``(V, V, V)``，``trans[a, b, c] = P(x_t=c | x_{t-2}=a, x_{t-1}=b)``；
+    ``order=1`` → 形状 ``(V, V)``，``trans[b, c] = P(x_t=c | x_{t-1}=b)``。
+    """
+    V = int(vocab)
+    g = rng(spawn_seed(seed, "synth"))
+    if order == 2:
+        return g.dirichlet(np.ones(V) * 0.25, size=(V, V))
+    if order == 1:
+        return g.dirichlet(np.ones(V) * 0.5, size=(V,))
+    raise ValueError(f"markov_transitions 仅支持 order ∈ {{1,2}}，得到 {order}")
+
+
+def markov_train_val(n_train: int, n_val: int, vocab: int, seed: int = 0,
+                     order: int = 2) -> tuple[np.ndarray, np.ndarray]:
+    """从**同一** order 阶马尔可夫源采样 (train, val) 两条独立序列。
+
+    修一个污染了整个基准的阴险 bug（门禁 G26 守着）：
+        旧 ``run_bench`` 用 ``synth_tokens(n, V, seed)`` 与
+        ``synth_tokens(m, V, seed + 7)`` 分别生成 train/val，而
+        :func:`markov_tokens` **每次调用都重抽转移矩阵** ⇒ train 与 val 竟是
+        **两个不同的马尔可夫源**。模型在源 A 上训练、却在源 B 上被评估，
+        val 交叉熵永远到不了熵下界 H，``learned fraction`` 指标因此失效
+        （把「能学会」误判成「学不会」，也把所有架构/优化器的 val 差异变成
+        跨源噪声）。本函数**只抽一次转移矩阵**，再用两个独立采样种子采出
+        train/val 两条序列，从结构上杜绝该 bug——val 是 train 同源的留出集，
+        「降到多少才算学会」重新变得可判定。
+    """
+    trans = markov_transitions(vocab, seed, order)
+
+    def _sample(n: int, sample_seed: int) -> np.ndarray:
+        s = rng(sample_seed)
+        out = np.zeros(n, dtype=np.int64)
+        a, b = 0, 1
+        for i in range(n):
+            p = trans[a, b] if order == 2 else trans[b]
+            c = s.choice(vocab, p=p)
+            out[i] = c
+            a, b = b, c
+        return out
+
+    return _sample(n_train, spawn_seed(seed, "train")), _sample(n_val, spawn_seed(seed, "val"))

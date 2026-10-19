@@ -18,6 +18,10 @@
       :func:`tianji.markov_entropy_rate` 算出并由门禁 G24 机检（见 B0）。
       因此本基准的绝对数字**不可与任何真实语料上的结果横向比较**，
       它只用于**同一实验内不同配置之间的相对比较**。
+    - train 与 val 由 :func:`tianji.markov_train_val` 从**同一转移矩阵**采样两条
+      独立序列得到（同源留出）。历史上曾用 `seed` 与 `seed+7` 分别生成，而
+      markov_tokens 每次调用都重抽转移矩阵 ⇒ train/val 竟是不同源，val 指标失效
+      （把「能学会」误判成「学不会」）；已修复并由门禁 G26 机检同源性防回归。
     - 模型规模在百万参数以下、训练步数在数百量级。
       这是 CPU + NumPy 后端的现实约束，不是「大模型」基准。
 """
@@ -36,7 +40,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from tianji.model import TianjiConfig, TianjiModel, init_params          # noqa: E402
 from tianji.data import (markov_tokens as synth_tokens,                  # noqa: E402
-                         markov_entropy_rate)
+                         markov_entropy_rate, markov_train_val)
 from tianji.l6_optimizer import HybridOptimizer, AdamW, Muon, Muon2       # noqa: E402
 from tianji.l7_train import DataLoader, Trainer, evaluate                 # noqa: E402
 from tianji.l8_infer import (quantize_per_channel, quantize_groupwise,    # noqa: E402
@@ -88,8 +92,7 @@ def run_train(cfg, tok, val_tok, steps, seed, opt_kind="muon2", lr=0.03,
 
 
 def bench_architecture(steps, seed):
-    tok = synth_tokens(6000, 64, seed)
-    val = synth_tokens(1500, 64, seed + 7)
+    tok, val = markov_train_val(6000, 1500, 64, seed)
     rows = []
     variants = [
         ("Hybrid 3:1 (GDN+MLA)", dict(hybrid_ratio=3)),
@@ -107,8 +110,7 @@ def bench_architecture(steps, seed):
 
 
 def bench_layout(steps, seed):
-    tok = synth_tokens(6000, 64, seed)
-    val = synth_tokens(1500, 64, seed + 7)
+    tok, val = markov_train_val(6000, 1500, 64, seed)
     rows = []
     for lay in ("interleave", "edge"):
         cfg = base_cfg(layout=lay)
@@ -121,8 +123,7 @@ def bench_layout(steps, seed):
 
 
 def bench_optimizer(steps, seed):
-    tok = synth_tokens(6000, 64, seed)
-    val = synth_tokens(1500, 64, seed + 7)
+    tok, val = markov_train_val(6000, 1500, 64, seed)
     rows = []
     for kind, lr in (("adamw", 3e-3), ("muon", 0.03), ("muon2", 0.03)):
         cfg = base_cfg()

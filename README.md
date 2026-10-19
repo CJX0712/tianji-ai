@@ -103,7 +103,7 @@ the quick brown fox. to be or not to be,
 | **L7** | 训练 | 余弦 / WSD 调度、梯度累积、梯度裁剪、bits-per-byte 度量 |
 | **L8** | 推理 | KV 状态缓存、per-channel INT8 / group-wise INT4、MTP 投机解码 |
 | **L9** | 对齐 | DPO / IPO / SimPO / KTO，统一走 `backward(g_logits=...)` 入口 |
-| **L10** | 微指令 + 门禁 | **1024 条可执行微指令**（32 家族 × 32）+ 25 道交付门禁 |
+| **L10** | 微指令 + 门禁 | **1024 条可执行微指令**（32 家族 × 32）+ 26 道交付门禁 |
 
 完整推导与逐层详解见 [ARCHITECTURE.md](ARCHITECTURE.md)。
 
@@ -147,8 +147,9 @@ Pre-RMSNorm → Mixer(GDN 或 MLA) → 残差 → Pre-RMSNorm → FFN(MoE 或 De
 | G21 数据管道 | D1-D4+T1 全机检 + 边界对抗：构造期响亮校验（曾抓出数据过短时 max(n,1) 静默钳制 → x/y batch 形状悄悄错位）、token 范围守卫（曾抓出负 token 被 numpy 静默回绕到词表末行——实测全 -1 输入 loss==0，模型「完美学会」垃圾）、y 对齐+切片指纹重放、确定性、T1 调度器端点+单调（l7_train 原宣称「门禁复检」但门禁不存在——与 G19 的 N3 同型宣称失配，已补齐）、梯度累积等价 accum=k==同 seed 重放 k batch 手动平均（逐位一致） | 0 失败 |
 | G22 原语不变性 | P3-P6 首次全部机检（宣称「门禁复检」但 4 条全无，已补齐）+ 边界守卫：RoPE 保范（含 20000 长度外推、1e-6~1e6 量级，1.63e-16）、相对位置性质（带非恒真性对照：位置差使内积变化 4.02e+00，否则恒等 RoPE 也能骗过门禁）、因果性（扰动未来不影响过去，0.00e+00）、注意力行和（4 组 GQA 组合，2.22e-16）；曾抓出「causal_mask_rect(Tq>Tk) 全 -inf 行 → softmax 0/0 → attention 静默 NaN 16/40」与「rope_tables 奇数维拼出 dim−1 表且构造阶段不报错」两个真实缺陷；P2「RMSNorm 输出 RMS 恒为 1」证伪（eps=1e-8 平滑项致偏差 2.67e-08），修正为精确闭式命题而非放宽阈值 | 0 失败 |
 | G23 GDN 归一化 | L1-L3 全部机检：**l2norm 单位范数契约** ‖k̂‖==1 对任意 ‖k‖（含 1e-12）成立、零向量→零输出——曾因分母 +1e-8 使 ‖k̂‖ 只剩 0.181（偏差 82%，delta rule 有效写入强度 β‖k̂‖² 被静默缩小到 0.016）；**尺度自适应梯度检验**（gradcheck 固定步长 1e-5 对 ‖k‖~1e-7 输入测量本身失效，已记入 l1_contract 局限）——同一公式配旧前向的相对误差 = eps/(‖k‖+eps)，‖k‖=1e-7 时达 17%；**三路径边界等价** α,β∈{0,0.5,1} × ‖k‖∈{1,1e-7,1e8} × chunk∈{1,3,T,T+5} 共 108 组，最大差 3.06e-16 | 0 失败 |
-| G24 基准熵下界 | E1 熵率自洽（2 阶马尔可夫源 H 由解析平稳分布法与 oracle 交叉熵法两套独立算法算出，差<5e-3，0<H<log(vocab)）+ E2 损失不破下界护栏（未训练模型验证 CE ≥ H，sub-entropy 即 loss bug）+ E3 基准诚实性（读 bench.json 断言各配置 learned fraction ≤ 1，本基准最大 −0.005 即无任何配置学会语料，见 BENCHMARKS.md 诚实结论） | H=3.0356 nats |
+| G24 基准熵下界 | E1 熵率自洽（2 阶马尔可夫源 H 由解析平稳分布法与 oracle 交叉熵法两套独立算法算出，差<5e-3，0<H<log(vocab)）+ E2 损失不破下界护栏（未训练模型验证 CE ≥ H，sub-entropy 即 loss bug）+ E3 基准诚实性（读 bench.json 断言各配置 learned fraction ≤ 1，本基准最大 −0.032 即无任何配置学会语料，见 BENCHMARKS.md 诚实结论） | H=3.0356 nats |
 | G25 全模型反向一致性 | 完整模型（GDN+MLA+MoE+MTP 装配）解析反向 vs 中心差分：抽样 336 条目最大混合比值 2.49e-03（判据 \|a−n\|≤atol+rtol·\|n\|，≤1 即过）—— G2 只校验独立原语反向，本门禁补齐 model.py 把它们装配成完整 Transformer 后的端到端反向（残差顺序/Pre-Norm/MoE 路由/MTP 头梯度），抓住「会训练却永远训不好」的阴险接线 bug | 2.49e-03 |
+| G26 基准 train/val 同源 | 机检基准语料 train/val 是否同源（修一个曾污染全基准的 bug）：markov_tokens 每次调用都重抽转移矩阵，旧 run_bench 用 seed 与 seed+7 分别生成 train/val ⇒ 竟是两个不同马尔可夫源，val 永远到不了 H、learned fraction 失效（把「能学会」误判成「学不会」）。修复：markov_train_val 只抽一次转移矩阵、采两条独立序列。E1 断言同源 val 的 oracle NLL≈H（3.0369 vs 3.0356），E2 以「不同源 ⇒ NLL 显著>H（6.96）」反证对照，证明对该 bug 敏感、能抓回归 | 同源 |
 
 **门禁的态度：失败就如实报失败，不允许放宽阈值凑绿。**
 
@@ -175,7 +176,7 @@ Pre-RMSNorm → Mixer(GDN 或 MLA) → 残差 → Pre-RMSNorm → FFN(MoE 或 De
 | A12 | 推理吞吐 | > 50 tok/s | **465 tok/s** |
 | A13 | 运行时依赖 | == 1 | **`['numpy']`** |
 | A14 | 单元测试 | 41/41 | **41/41** |
-| A15 | 交付门禁 | 25/25 | **25/25** |
+| A15 | 交付门禁 | 26/26 | **26/26** |
 | A16 | 断网可运行 | 0 处网络依赖 | **0** |
 
 三条判据的设定依据（A3 为何是 10%、A7 为何用权重误差、A8 为何放宽到 15%）
@@ -205,7 +206,7 @@ python scripts/quickstart.py          # 最小示例，约 10 秒
 2. 模型   4 层 布局=LLLA (A=MLA, L=GatedDeltaNet)，参数 252,032
 4. 训练   30 步 2.4s，loss 6.8636 -> 0.2036
 6. 生成   结果='the quick brown fox jumps over the lazy dog. ...'
-7. 门禁   25/25 通过
+7. 门禁   26/26 通过
 ✅ 全部通过
 ```
 
@@ -252,7 +253,7 @@ make verify-all        # 测试 + 门禁 + 最小示例（交付自查）
 
 ```bash
 docker build -t tianji:latest .
-docker run --rm tianji:latest gates      # 跑 25 道门禁
+docker run --rm tianji:latest gates      # 跑 26 道门禁
 docker run --rm tianji:latest test       # 跑 95 个测试
 
 docker compose run --rm tianji train     # 训练，产物落在 ./runs
@@ -291,7 +292,7 @@ python bench/run_bench.py --steps 120 --seed 0     # 约 2 分钟，写 bench/re
 ```bash
 make help          # 查看全部目标
 make test          # 95 个单元测试
-make gates         # 25 道交付门禁
+make gates         # 26 道交付门禁
 make bench         # 完整基准
 make quickstart    # 最小示例
 make train         # 训练
@@ -313,12 +314,14 @@ NumPy 2.5.4 纯 CPU、合成 2 阶马尔可夫语料（vocab=64）、d_model=64 
 
 | 架构 | 参数量 | 训练 loss | **验证 loss** | ms/步 |
 |---|---:|---:|---:|---:|
-| **Hybrid 3:1（GDN + MLA）** | 396,544 | 4.4291 | **4.1892** | 170 |
-| 全注意力（MLA） | 364,224 | **4.3451** | 4.2933 | 93 |
-| 全 GDN（无注意力层） | 396,544 | 4.3290 | 4.2504 | 154 |
+| Hybrid 3:1（GDN + MLA） | 396,544 | 4.3145 | 4.2481 | 180 |
+| 全注意力（MLA） | 364,224 | 4.3530 | 4.2705 | 99 |
+| 全 GDN（无注意力层） | 396,544 | 4.3823 | **4.1944** | 177 |
 
-混合架构验证损失比全注意力低 **2.4%**。差异幅度小、单一 seed，**不足以断言质量更优** ——
-真正的收益在下面 B5。
+验证损失上全 GDN 最低（4.1944）、Hybrid 次之（4.2481）、全注意力最高（4.2705）；
+但三者 learned fraction 均为负（没有一个真正学会语料），且**相对排序在 train/val 同源修复后
+发生了翻转**（旧 bug 版是 Hybrid 最优）——证明这些微小差异是噪声/方法论假象，
+**不能用于架构优劣论断**。真正的收益在 B5。
 
 ### B5 · KV cache（本架构最硬的收益）
 
@@ -344,19 +347,16 @@ NumPy 2.5.4 纯 CPU、合成 2 阶马尔可夫语料（vocab=64）、d_model=64 
 
 | 优化器 | 训练 loss | 验证 loss |
 |---|---:|---:|
-| AdamW (lr 3e-3) | **4.1233** | 4.2481 |
-| Muon (NS 5 步) | 4.4911 | **4.1642** |
-| Muon2 (NS 3 步) | 4.4291 | 4.1892 |
+| AdamW (lr 3e-3) | **4.1121** | 4.2322 |
+| Muon (NS 5 步) | 4.4875 | **4.2003** |
+| Muon2 (NS 3 步) | 4.3145 | 4.2481 |
 
-**Muon2 在本项目规模下验证损失略逊于 Muon（4.1892 vs 4.1642）**，
-与 Muon2 论文（60M~15.5B 规模）的结论**不一致**。两条诚实解释：
+**验证损失上 Muon 最好（4.2003）、AdamW 次之（4.2322）、默认的 Muon2 最差（4.2481）**——
+这是对默认选项不友好的负面观察。但三者 learned fraction 均为负、验证损失都略高于 uniform，
+差异（~0.05 nats）落在噪声内，且排序随 train/val 同源修复而变（旧 bug 版 AdamW 最差），
+**不能用于论证优化器优劣**，只说明本规模下三者都没学会该语料。
 
-1. **规模**：论文结论建立在千万到百亿参数、数千步训练上；本项目 40 万参数、120 步，
-   优化器差异淹没在噪声里。
-2. **实现保真度**：本项目只实现论文核心改动，未复现其分布式通信与 NS 步数自适应调度。
-   门禁 G7 实测 3 步对齐度是 5 步的 **94.6%**，未达论文声称的「3 步 ≥ 5 步」。
-
-默认仍是 Muon2（少 40% NS 迭代）；追求本规模极限质量可切 Muon（`--optim muon`）。
+默认仍是 Muon2（少 40% NS 迭代）；追求本规模极限验证质量可切 Muon（`--optim muon`）。
 
 ### 与现有最优方案的定位对比
 
@@ -368,7 +368,7 @@ NumPy 2.5.4 纯 CPU、合成 2 阶马尔可夫语料（vocab=64）、d_model=64 
 | 训练 | ✅ CPU 可训 | ✅ GPU | ❌ | ✅ GPU |
 | 量化 / 投机解码 | ✅ | ❌ | ✅ | ❌ |
 | 对齐（DPO 等） | ✅ | ❌ | ❌ | ❌ |
-| **可证门禁** | **✅ 25 道** | ❌ | ❌ | 部分 |
+| **可证门禁** | **✅ 26 道** | ❌ | ❌ | 部分 |
 | 吞吐 | 低（NumPy CPU） | 高 | 极高 | 极高 |
 
 **诚实的结论**：本项目**不追求吞吐**。它的对标对象是「正确性可独立验证的研究级实现」，
@@ -472,7 +472,7 @@ tianji-ai/
 │   ├── model.py               3:1 混合模型组装
 │   ├── persist.py             checkpoint 保存/加载：sha256+指纹校验、路径规范化、原子落盘
 │   ├── data.py                内置离线语料
-│   ├── verify.py              25 道交付门禁
+│   ├── verify.py              26 道交付门禁
 │   └── cli.py                 命令行入口
 ├── scripts/
 │   ├── reproduce.sh             一键复现（Linux / macOS，无需 Docker）

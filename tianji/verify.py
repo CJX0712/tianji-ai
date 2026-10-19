@@ -159,6 +159,13 @@
                     完整 Transformer 后的端到端反向（残差顺序/Pre-Norm/MoE 路由/
                     MTP 头梯度），抓住「会训练却永远训不好」的阴险接线 bug
                     （实测最大混合比值 2.5e-03，远小于 1）
+    G26 基准 train/val 同源 机检基准语料的 train/val 是否同源（修一个曾污染全基准的
+                    阴险 bug）：markov_tokens 每次调用都重抽转移矩阵，旧 run_bench 用
+                    seed 与 seed+7 分别生成 train/val ⇒ 竟是两个不同马尔可夫源，val 永远
+                    到不了 H、learned fraction 失效（把「能学会」误判成「学不会」）。修复：
+                    markov_train_val 只抽一次转移矩阵、采两条独立序列。门禁 E1 断言同源 val
+                    的 oracle NLL≈H，E2 以「不同源 ⇒ NLL 显著>H」作反证对照，证明对该 bug
+                    敏感、能抓住回归
 """
 
 from __future__ import annotations
@@ -1818,6 +1825,48 @@ def run_all_gates(seed: int = 0, steps: int = 60, verbose: bool = True) -> GateR
         f"≤1 即过；最差 {info25[0]}[{info25[1]}] 解析 {info25[2]:.3e} vs 数值 "
         f"{info25[3]:.3e}）—— 证明 model.py 的残差/Pre-Norm/MoE/MTP 接线反向正确",
         worst_ratio=float(worst25), n_samples=len(samples25))
+    R.results[-1].seconds = time.time() - t0
+
+    # ---- G26 · 基准 train/val 同源（防回归：抓一个曾污染全基准的阴险 bug） ----
+    # 为什么需要：markov_tokens 每次调用都从 spawn_seed(seed,"synth") 重抽转移矩阵。
+    # 旧 run_bench 用 synth_tokens(n,V,seed) 与 synth_tokens(m,V,seed+7) 分别生成
+    # train/val ⇒ 两者竟是**两个不同的马尔可夫源**：模型在源 A 上训练、却在源 B 上被
+    # 评估，val 交叉熵永远到不了熵下界 H，learned fraction 指标因此失效——它把
+    # 「本可学会」误判成「学不会」，也让所有架构/优化器的 val 差异沦为跨源噪声
+    # （实测：不同源 val 的 oracle NLL 高达 ~6.96，超出 H 近 4 nats）。修复：
+    # markov_train_val 只抽一次转移矩阵、再采两条独立序列，run_bench 已全部改用它。
+    # 本门禁机检同源不变量，并自带「反证对照」证明对该 bug 敏感：
+    #   E1 同源不变量 —— markov_train_val 采出的 val，在训练源真实转移下的 oracle
+    #      NLL ≈ H（|NLL−H| < 0.05），证明 val 是 train 同源的留出集；
+    #   E2 反证对照 —— 换一个源（旧 bug 的 seed+7 模式）oracle NLL 显著 > H（> H+0.3）。
+    # 若有人把 val 改回不同源，E1 立即失败 ⇒ 精准抓住回归。
+    t0 = time.time()
+    from tianji.data import (markov_transitions, markov_train_val,  # noqa: E402
+                             markov_tokens)
+    _V, _seed = 64, 0
+    _trans = markov_transitions(_V, _seed, 2)
+    _H26 = float(markov_entropy_rate(_V, _seed, 2)["H"])
+
+    def _oracle_nll(seq):
+        a, b, c = seq[:-2], seq[1:-1], seq[2:]
+        return float(-np.log(_trans[a, b, c] + 1e-300).mean())
+
+    _tr26, _va26 = markov_train_val(200_000, 200_000, _V, _seed, 2)
+    _nll_same = _oracle_nll(_va26)
+    _va_bad = markov_tokens(200_000, _V, _seed + 7, 2)   # 旧 bug 模式：不同源
+    _nll_diff = _oracle_nll(_va_bad)
+    e1 = abs(_nll_same - _H26) < 0.05
+    e2 = _nll_diff > _H26 + 0.3
+    ok26 = bool(e1 and e2)
+    add("基准 train/val 同源", ok26,
+        f"E1 同源不变量：markov_train_val 采出的 val 在训练源真实转移下 oracle NLL="
+        f"{_nll_same:.4f} ≈ H={_H26:.4f}（|差|={abs(_nll_same - _H26):.4f}<0.05），"
+        f"证明 train/val 同源、val 是留出集而非另一马尔可夫源；E2 反证对照：改用旧 bug 的 "
+        f"seed+7 不同源，oracle NLL={_nll_diff:.4f}（> H+{_nll_diff - _H26:.2f}，显著膨胀）"
+        f"——证明本门禁对「val 不同源」bug 敏感、能抓住回归（该 bug 曾让 learned fraction "
+        f"指标失效、把「能学会」误判成「学不会」）",
+        val_oracle_nll=float(_nll_same), H=float(_H26),
+        diff_source_nll=float(_nll_diff), same_source=bool(e1))
     R.results[-1].seconds = time.time() - t0
 
     return R

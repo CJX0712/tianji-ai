@@ -431,12 +431,15 @@ from tianji import save_checkpoint, load_checkpoint, checkpoint_info, Checkpoint
 ## 数据
 
 ```python
-from tianji import TINY_TALE, default_corpus, markov_tokens, markov_entropy_rate
+from tianji import (TINY_TALE, default_corpus, markov_tokens,
+                    markov_entropy_rate, markov_transitions, markov_train_val)
 ```
 
 - `TINY_TALE` —— 极小的中英混合文本
 - `default_corpus()` —— 默认训练语料（约 93.5KB，71280 字符）
-- `markov_tokens(n, vocab, seed=0, order=2)` —— 确定性合成马尔可夫序列（基准语料源；与 `bench/run_bench.py` 同源，已去重）
+- `markov_tokens(n, vocab, seed=0, order=2)` —— 确定性合成马尔可夫序列（基准语料源；与 `bench/run_bench.py` 同源，已去重）。注意：每次调用都会按 seed **重抽转移矩阵**，因此不同 seed 是不同马尔可夫源
+- `markov_transitions(vocab, seed=0, order=2)` —— 抽出该 seed 对应的转移矩阵本身（order=2 形状 `(V,V,V)`，`trans[a,b,c]=P(x_t=c|x_{t-2}=a,x_{t-1}=b)`），与 `markov_tokens` 完全同源，供 oracle 类判据直接使用
+- `markov_train_val(n_train, n_val, vocab, seed=0, order=2)` —— **train/val 同源留出切分**（G26 修复后基准唯一入口）：只抽一次转移矩阵，再用两个独立采样种子（`spawn_seed(seed,"train")` / `spawn_seed(seed,"val")`）采两条独立序列。旧 `run_bench` 用 `synth_tokens(n,V,seed)` 与 `synth_tokens(m,V,seed+7)` 生成 train/val，`+7` 会重抽转移矩阵 ⇒ 两个不同马尔可夫源，val 永远到不了熵下界 H（oracle NLL 实测 6.96 vs H≈3.04），learned fraction 指标失效
 - `markov_entropy_rate(vocab=64, seed=0, order=2, n_sample=200_000, tol=5e-3)` —— 计算该马尔可夫源的**熵率下界 H**，返回 dict（`H / H_analytic / H_oracle / abs_diff / consistent` 等）。**两套独立算法互相印证**（解析平稳分布法 + oracle 交叉熵法），是「降到多少才算学会」的可机检判据，由门禁 G24 守着
 
 全部离线，无任何下载。
@@ -448,8 +451,8 @@ from tianji import TINY_TALE, default_corpus, markov_tokens, markov_entropy_rate
 ```python
 from tianji import run_all_gates, GateReport, GateResult
 rep = run_all_gates(seed=0, steps=40)
-print(rep.table())        # G1..G25 的 PASS/FAIL 与实测值
-rep.all_green             # 是否 25/25
+print(rep.table())        # G1..G26 的 PASS/FAIL 与实测值
+rep.all_green             # 是否 26/26
 ```
 
 ---
@@ -457,7 +460,7 @@ rep.all_green             # 是否 25/25
 ## 命令行
 
 ```bash
-python -m tianji.cli gates      # 25 道交付门禁
+python -m tianji.cli gates      # 26 道交付门禁
 python -m tianji.cli test       # 模块梯度检验冒烟
 python -m tianji.cli bench      # 完整基准
 python -m tianji.cli microops   # 微指令统计（--show 列出全部家族）
