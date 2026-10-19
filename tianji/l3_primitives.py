@@ -26,7 +26,10 @@
 
 不变量（门禁复检）：
     P1 全部模块的解析反向通过中心差分检验（相对误差 < 1e-6）
-    P2 RMSNorm 的输出 RMS 恒为 1（未乘增益时）
+    P2 RMSNorm 的输出 RMS == sqrt(m₂/(m₂+eps))（m₂ = mean(x²)，
+       G22 门禁机检精确到 1e-14）；eps=1e-8 是数值保护项，因此**不等于
+       恒为 1** —— 早期 docstring 写「RMS 恒为 1」是不精确宣称，
+       实测偏差 2.67e-08 恰由该平滑项产生；大信号（m₂ >> eps）下趋于 1
     P3 RoPE 保持范数：‖RoPE(x)‖ == ‖x‖（旋转是正交变换）
     P4 RoPE 的相对位置性质：⟨q_i, k_j⟩ 只依赖 (i - j)
     P5 因果注意力：第 t 个输出与 t 之后的 token 无关（扰动未来，输出不变）
@@ -135,7 +138,16 @@ def rope_tables(dim: int, max_len: int, base: float = 10000.0) -> tuple[np.ndarr
     θᵢ = 1 / base^(2i/dim)，i = 0..dim/2−1；位置 p 的旋转角 = p·θᵢ。
     因为采用 rotate_half 布局（前 d/2 与后 d/2 配对），
     cos/sin 表需要把前半维复制到后半维，才能与 (..., dim) 的输入广播。
+
+    dim 必须是偶数（G22 抓出的静默缺陷）：rotate_half 要求前后半配对，
+    奇数 dim 时 `np.concatenate([c, c])` 只能拼出 dim−1 长度的表 ——
+    **表构造阶段不报错**，直到 RoPE.forward 广播时才在深处抛
+    ValueError，且信息完全指向不了根因。此处直接响亮失败。
     """
+    if dim < 2 or dim % 2 != 0:
+        raise ValueError(
+            f"RoPE 的 dim 必须是不小于 2 的偶数（rotate_half 需要前后半配对），"
+            f"得到 {dim}")
     half = dim // 2
     inv = 1.0 / (base ** (2.0 * np.arange(0, half, dtype=np.float64) / dim))
     pos = np.arange(max_len, dtype=np.float64)[:, None]
@@ -241,7 +253,17 @@ def causal_mask_rect(Tq: int, Tk: int) -> np.ndarray:
     位置 (Tk − Tq + i)，因此它能看到的 key 是 j <= Tk − Tq + i。
     写成方阵再切片会在这里出错 —— 这是 KV cache 实现里最常见的 bug：
     左对齐会让最新 token 看不到任何历史，损失暴涨但不报错。
+
+    Tq > Tk 一律拒绝（G22 抓出的静默 NaN）：此时前 (Tq − Tk) 行的
+    query 一个 key 都看不到，整行 −inf ⇒ softmax 分母 exp(−inf) 全 0
+    ⇒ 0/0 = NaN，输出带着 RuntimeWarning 静默污染整条链路。注意力分布
+    在这种行上数学上无定义，必须在构造掩码处一声响亮失败。
     """
+    if Tq > Tk:
+        raise ValueError(
+            f"Q 长度 ({Tq}) 不能超过 K/V 长度 ({Tk})：右对齐因果掩码下前 "
+            f"{Tq - Tk} 行的 query 看不到任何 key，注意力分布无定义"
+            f"（softmax 全 -inf 行会静默产生 NaN）")
     offset = Tk - Tq
     i = np.arange(Tq, dtype=np.int64)[:, None]
     j = np.arange(Tk, dtype=np.int64)[None, :]

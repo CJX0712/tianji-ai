@@ -1294,6 +1294,131 @@ def test_gradient_accumulation_equivalence():
         assert np.allclose(g_acc[k], g_sum[k] / K, atol=1e-12)
 
 
+# ============================================================ 原语（G22）
+
+def _rot(u, pos, c, s):
+    """把向量 u 放到 pos 位置做 RoPE，返回 D 维向量。"""
+    D = u.shape[0]
+    return RoPE().forward(Ctx(), u.reshape(1, 1, 1, D),
+                          c[pos:pos + 1], s[pos:pos + 1])[0, 0, 0]
+
+
+def test_rope_preserves_norm():
+    """P3（G22 首次机检）：‖RoPE(x)‖ == ‖x‖，含长度外推与极端量级。"""
+    g = rng(11)
+    worst = 0.0
+    for L in (16, 512, 20000):
+        c, s = rope_tables(8, L)
+        for pos in (0, 1, L - 1, max(L - 2, 0)):
+            for scale in (1e-6, 1.0, 1e6):
+                x = g.standard_normal((2, 3, 1, 8)) * scale
+                y = RoPE().forward(Ctx(), x, c[pos:pos + 1], s[pos:pos + 1])
+                n0 = np.linalg.norm(x, axis=-1)
+                n1 = np.linalg.norm(y, axis=-1)
+                worst = max(worst, float(np.abs(n1 - n0).max() / np.abs(n0).max()))
+    assert worst < 1e-12, f"RoPE 不保范: {worst:.2e}"
+
+
+def test_rope_relative_position_property():
+    """P4：⟨q_i, k_j⟩ 只依赖 (i-j)，且带非恒真性对照。"""
+    g = rng(12)
+    c, s = rope_tables(8, 256)
+    q, k = g.standard_normal((8,)), g.standard_normal((8,))
+    worst = 0.0
+    for base in (0, 7, 100, 200):
+        for off in (0, 1, 3, 5):
+            lhs = float(_rot(q, base + off, c, s) @ _rot(k, base, c, s))
+            rhs = float(_rot(q, off, c, s) @ _rot(k, 0, c, s))
+            worst = max(worst, abs(lhs - rhs))
+    assert worst < 1e-10, f"相对位置性质被破坏: {worst:.2e}"
+    # 对照：位置差必须真的改变内积（否则恒等 RoPE 也能骗过上式）
+    ctrl = max(abs(float(_rot(q, 100 + off, c, s) @ _rot(k, 100, c, s))
+                   - float(_rot(q, 100, c, s) @ _rot(k, 100, c, s)))
+               for off in (1, 3, 5))
+    assert ctrl > 1e-6, f"命题退化为恒真（对照差异过小）: {ctrl:.2e}"
+
+
+def test_attention_causality():
+    """P5：扰动未来的 q/k，过去位置的输出不变。"""
+    g = rng(13)
+    B, H, T, D = 2, 2, 6, 4
+    q, k, v = (g.standard_normal((B, H, T, D)) for _ in range(3))
+    o1 = CausalAttention().forward(Ctx(), q, k, v)
+    q2, k2 = q.copy(), k.copy()
+    q2[:, :, 3:] += 1.0
+    k2[:, :, 3:] += 1.0
+    o2 = CausalAttention().forward(Ctx(), q2, k2, v)
+    assert np.abs(o2[:, :, :3] - o1[:, :, :3]).max() < 1e-12
+
+
+def test_attention_row_sums_gqa():
+    """P6：注意力行和恒为 1，GQA 各倍数下均成立且无 NaN。"""
+    g = rng(14)
+    for Hq, Hkv in ((4, 4), (4, 2), (6, 1), (2, 2)):
+        ctx = Ctx()
+        CausalAttention().forward(ctx, g.standard_normal((2, Hq, 6, 4)),
+                                  g.standard_normal((2, Hkv, 6, 4)),
+                                  g.standard_normal((2, Hkv, 6, 4)))
+        P = ctx["P"]
+        assert np.isnan(P).sum() == 0
+        assert np.abs(P.sum(-1) - 1.0).max() < 1e-12
+
+
+def test_causal_mask_rect_rejects_tq_gt_tk():
+    """B1（G22 抓出的静默 NaN）：Tq>Tk 产生全 -inf 行 → softmax 0/0。"""
+    for tq, tk in ((5, 3), (2, 1), (10, 9)):
+        with pytest.raises(ValueError):
+            causal_mask_rect(tq, tk)
+    with pytest.raises(ValueError):
+        CausalAttention().forward(Ctx(), rng(15).standard_normal((1, 2, 5, 4)),
+                                  rng(15).standard_normal((1, 2, 3, 4)),
+                                  rng(15).standard_normal((1, 2, 3, 4)))
+    # 合法的增量解码场景无 NaN
+    o = CausalAttention().forward(Ctx(), rng(15).standard_normal((1, 2, 3, 4)),
+                                  rng(15).standard_normal((1, 2, 7, 4)),
+                                  rng(15).standard_normal((1, 2, 7, 4)))
+    assert np.isnan(o).sum() == 0
+
+
+def test_rope_tables_rejects_odd_dim():
+    """B2（G22 抓出的静默错表）：奇数 dim 拼出 dim-1 表且构造阶段不报错。"""
+    for d in (1, 5, 7):
+        with pytest.raises(ValueError):
+            rope_tables(d, 8)
+    assert rope_tables(8, 4)[0].shape == (4, 8)
+
+
+def test_rmsnorm_matches_eps_closed_form():
+    """B3/P2：输出 RMS 命中 sqrt(m2/(m2+eps)) 闭式，非「恒为 1」。"""
+    g = rng(16)
+    eps = RMSNorm().eps
+    w = g.standard_normal((8,)) + 2.0
+    for scale in (1.0, 100.0):
+        x = g.standard_normal((2, 3, 8)) * scale
+        y = RMSNorm().forward(Ctx(), x, w)
+        xh = y / w
+        m2 = np.mean(x ** 2, axis=-1)
+        got = np.sqrt(np.mean(xh ** 2, axis=-1))
+        want = np.sqrt(m2 / (m2 + eps))
+        assert np.abs(got - want).max() < 1e-14
+        # 偏差不得超出 eps 平滑项的理论后果
+        assert (np.abs(got - 1.0) <= (1.0 - want) * 1.001 + 1e-15).all()
+    assert np.all(np.isfinite(RMSNorm().forward(Ctx(), np.zeros((2, 3, 8)), np.ones(8))))
+    assert np.all(np.isfinite(
+        RMSNorm().forward(Ctx(), g.standard_normal((2, 3, 8)) * 1e150, np.ones(8))))
+
+
+def test_crossentropy_all_ignored_targets():
+    """B4：全 -1 targets → loss==0 且梯度精确全零、无 NaN。"""
+    g = rng(17)
+    ctx = Ctx()
+    loss = float(CrossEntropy().forward(ctx, g.standard_normal((2, 3, 5)),
+                                        np.full((2, 3), -1, dtype=np.int64)))
+    grad = CrossEntropy().backward(ctx, 1.0)[0]
+    assert loss == 0.0
+    assert np.all(grad == 0.0) and np.isnan(grad).sum() == 0
+
+
 # ============================================================ 门禁
 
 def test_all_gates():

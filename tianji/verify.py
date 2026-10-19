@@ -112,6 +112,24 @@
                     lr_min）+ warmup 后单调不增 + 多参数组合扫描；
                     (g) 梯度累积等价：accum=k 一次 step 的梯度 ==
                     同 seed 重放 k batch 的手动平均（确定性重放）
+    G22 原语不变性    P3-P6 首次全部机检（l3 docstring 宣称「门禁复检」
+                    但门禁不存在 —— 与 G19 的 N3 / G21 的 T1 同型的
+                    第 3 次宣称-门禁失配）+ 边界守卫 B1-B4：
+                    (a) P3 RoPE 保范 ‖RoPE(x)‖==‖x‖（含 20000 长度外推、
+                    1e-6~1e6 量级）；(b) P4 相对位置 ⟨q_i,k_j⟩ 只依赖
+                    (i−j)，且带非恒真性对照（不同 off 的内积必须显著
+                    不同，否则 RoPE 退化成恒等也能骗过门禁）；
+                    (c) P5 因果性（扰动未来不影响过去输出）；(d) P6
+                    注意力行和恒==1（含 GQA H/Hkv 倍数）；
+                    (e) B1 全掩码行守卫 —— 探针抓出「causal_mask_rect
+                    (Tq>Tk) 产生全 -inf 行 → softmax 0/0 → attention
+                    输出静默 NaN（16/40）」的真实缺陷，修复为构造期
+                    ValueError；(f) B2 RoPE 奇数维 —— 探针抓出
+                    rope_tables(dim=5) 拼出 dim−1 长度表且**表构造阶段
+                    不报错**，到 forward 深处才崩，修复为构造期拒绝；
+                    (g) B3 RMSNorm 零输入/1e150 稳定 + P2 输出 RMS==1；
+                    (h) B4 CrossEntropy 全忽略 targets → loss==0 且
+                    梯度精确全零、无 NaN
 """
 
 from __future__ import annotations
@@ -1409,6 +1427,158 @@ def run_all_gates(seed: int = 0, steps: int = 60, verbose: bool = True) -> GateR
         guards=guard_ok, edge=edge_ok, tok_guard=tok_guard_ok, align=align_ok,
         det=det21, sched=sched_ok, sched_dev=sched_worst, accum=accum_ok,
         accum_rel=accum_rel)
+    R.results[-1].seconds = time.time() - t0
+
+    # ---------------------------------------------------------- G22 原语不变性
+    t0 = time.time()
+    from .l1_contract import Ctx as _Ctx
+    from .l3_primitives import (RMSNorm as _RMS, RoPE as _RoPE, rope_tables as _rtab,
+                                CausalAttention as _CA, CrossEntropy as _CE,
+                                causal_mask_rect as _cmr)
+    g22 = rng(spawn_seed(seed, "primitives"))
+
+    def _rot22(u, pos, D, c, s):
+        return _RoPE().forward(_Ctx(), np.asarray(u).reshape(1, 1, 1, D),
+                               c[pos:pos + 1], s[pos:pos + 1])[0, 0, 0]
+
+    # ---- (a) P3 保范：含长度外推与极端量级
+    p3_worst = 0.0
+    for _L in (16, 512, 20000):
+        c22, s22 = _rtab(8, _L)
+        for _pos in (0, 1, min(_L - 1, 19999), max(_L - 2, 0)):
+            for _scale in (1e-6, 1.0, 1e6):
+                _x = g22.standard_normal((2, 3, 1, 8)) * _scale
+                _y = _RoPE().forward(_Ctx(), _x, c22[_pos:_pos + 1], s22[_pos:_pos + 1])
+                _n0 = np.linalg.norm(_x, axis=-1)
+                _n1 = np.linalg.norm(_y, axis=-1)
+                p3_worst = max(p3_worst,
+                               float(np.abs(_n1 - _n0).max() / (np.abs(_n0).max() + 1e-30)))
+    p3_ok = p3_worst < 1e-12
+
+    # ---- (b) P4 相对位置 + 非恒真性对照（RoPE 退化成恒等也会被抓）
+    c22b, s22b = _rtab(8, 256)
+    _q0 = g22.standard_normal((8,)); _k0 = g22.standard_normal((8,))
+    p4_worst, p4_ctrl = 0.0, 0.0
+    for _base in (0, 7, 100, 200):
+        for _off in (0, 1, 3, 5):
+            p4_worst = max(p4_worst, abs(
+                float(_rot22(_q0, _base + _off, 8, c22b, s22b) @ _rot22(_k0, _base, 8, c22b, s22b))
+                - float(_rot22(_q0, _off, 8, c22b, s22b) @ _rot22(_k0, 0, 8, c22b, s22b))))
+    # 对照：位置差改变内积必须显著（否则整个命题对恒等 RoPE 也成立 = 假绿）
+    for _off in (1, 3, 5):
+        p4_ctrl = max(p4_ctrl, abs(
+            float(_rot22(_q0, 100 + _off, 8, c22b, s22b) @ _rot22(_k0, 100, 8, c22b, s22b))
+            - float(_rot22(_q0, 100, 8, c22b, s22b) @ _rot22(_k0, 100, 8, c22b, s22b))))
+    p4_ok = p4_worst < 1e-10 and p4_ctrl > 1e-6
+
+    # ---- (c) P5 因果性
+    _B, _H, _T, _D = 2, 2, 6, 4
+    _qa = g22.standard_normal((_B, _H, _T, _D))
+    _ka = g22.standard_normal((_B, _H, _T, _D))
+    _va = g22.standard_normal((_B, _H, _T, _D))
+    _o1 = _CA().forward(_Ctx(), _qa, _ka, _va)
+    _qa2, _ka2 = _qa.copy(), _ka.copy()
+    _qa2[:, :, 3:] += 1.0
+    _ka2[:, :, 3:] += 1.0
+    _o2 = _CA().forward(_Ctx(), _qa2, _ka2, _va)
+    p5_dev = float(np.abs(_o2[:, :, :3] - _o1[:, :, :3]).max())
+    p5_ok = p5_dev < 1e-12
+
+    # ---- (d) P6 行和（含 GQA 两种倍数）
+    p6_worst, p6_nan = 0.0, 0
+    for _Hq, _Hkv in ((4, 4), (4, 2), (6, 1), (2, 2)):
+        _ctx22 = _Ctx()
+        _CA().forward(_ctx22, g22.standard_normal((2, _Hq, 6, 4)),
+                      g22.standard_normal((2, _Hkv, 6, 4)),
+                      g22.standard_normal((2, _Hkv, 6, 4)))
+        _P = _ctx22["P"]
+        p6_worst = max(p6_worst, float(np.abs(_P.sum(-1) - 1.0).max()))
+        p6_nan += int(np.isnan(_P).sum())
+    p6_ok = p6_worst < 1e-12 and p6_nan == 0
+
+    # ---- (e) B1 全掩码行守卫（Tq > Tk）
+    b1_ok = True
+    for _tq, _tk in ((5, 3), (2, 1), (10, 9)):
+        try:
+            _cmr(_tq, _tk)
+            b1_ok = False
+        except ValueError:
+            pass
+        except Exception:
+            b1_ok = False
+    try:
+        _CA().forward(_Ctx(), g22.standard_normal((1, 2, 5, 4)),
+                      g22.standard_normal((1, 2, 3, 4)),
+                      g22.standard_normal((1, 2, 3, 4)))
+        b1_ok = False
+    except ValueError:
+        pass
+    # 合法场景零 NaN
+    _olegal = _CA().forward(_Ctx(), g22.standard_normal((1, 2, 3, 4)),
+                            g22.standard_normal((1, 2, 7, 4)),
+                            g22.standard_normal((1, 2, 7, 4)))
+    b1_ok = b1_ok and int(np.isnan(_olegal).sum()) == 0
+
+    # ---- (f) B2 RoPE 奇偶维
+    b2_ok = True
+    for _d in (1, 5, 7):
+        try:
+            _rtab(_d, 8)
+            b2_ok = False
+        except ValueError:
+            pass
+        except Exception:
+            b2_ok = False
+
+    # ---- (g) B3/P2 RMSNorm：空/极端输入稳定，输出 RMS 命中 eps 平滑闭式
+    #      精确命题：RMS(y/w) == sqrt(m2/(m2+eps))（不是恒为 1 ——
+    #      早期 docstring 的「RMS 恒为 1」是不精确宣称，偏差来自 eps）
+    _eps22 = _RMS().eps
+    _w22 = g22.standard_normal((8,)) + 2.0
+    rms_closed = 0.0
+    rms_bound = -np.inf          # 实测偏差 减去 eps 理论偏差上界，必须 <= 0
+    for _scale in (1.0, 100.0):  # 覆盖 m2 ~ eps 到 m2 >> eps
+        _x22 = g22.standard_normal((2, 3, 8)) * _scale
+        _y22 = _RMS().forward(_Ctx(), _x22, _w22)
+        _xh = _y22 / _w22
+        _m2 = np.mean(_x22 ** 2, axis=-1)
+        _got = np.sqrt(np.mean(_xh ** 2, axis=-1))
+        _want = np.sqrt(_m2 / (_m2 + _eps22))
+        rms_closed = max(rms_closed, float(np.abs(_got - _want).max()))
+        # 偏差不得超出 eps 平滑项的理论后果 1 − sqrt(m2/(m2+eps))
+        # （若 eps 位置写错、量级写错、或漏了 eps 保护都会被这条抓到）
+        _bound = (1.0 - _want) * 1.001 + 1e-15
+        rms_bound = max(rms_bound, float((np.abs(_got - 1.0) - _bound).max()))
+    _z1 = _RMS().forward(_Ctx(), np.zeros((2, 3, 8)), np.ones(8))
+    _z2 = _RMS().forward(_Ctx(), g22.standard_normal((2, 3, 8)) * 1e150, np.ones(8))
+    b3_ok = (np.all(np.isfinite(_z1)) and np.all(np.isfinite(_z2))
+             and rms_closed < 1e-14 and rms_bound <= 0.0)
+
+    # ---- (h) B4 CrossEntropy 全忽略
+    _c22 = _Ctx()
+    _lg = g22.standard_normal((2, 3, 5))
+    _l22 = float(_CE().forward(_c22, _lg, np.full((2, 3), -1, dtype=np.int64)))
+    _gb = _CE().backward(_c22, 1.0)[0]
+    b4_ok = (_l22 == 0.0 and bool(np.all(_gb == 0.0))
+             and int(np.isnan(_gb).sum()) == 0)
+
+    ok22 = (p3_ok and p4_ok and p5_ok and p6_ok and b1_ok and b2_ok
+            and b3_ok and b4_ok)
+    add("原语不变性", ok22,
+        f"P3 RoPE 保范 {p3_worst:.2e}（含 20000 长度外推、1e-6~1e6 量级）；"
+        f"P4 相对位置 {p4_worst:.2e}（对照：位置差使内积变化 {p4_ctrl:.2e}，"
+        f"非恒真命题）；P5 因果性偏差 {p5_dev:.2e}；P6 注意力行和 "
+        f"{p6_worst:.2e}、NaN={p6_nan}（4 组 H/Hkv 组合含 GQA）；"
+        f"B1 全掩码行守卫={b1_ok}（曾静默 NaN 16/40）；B2 RoPE 奇偶维="
+        f"{b2_ok}（曾拼出 dim−1 表且不报错）；B3/P2 RMSNorm 闭式命中 "
+        f"{rms_closed:.2e}（<1e-14）+ 偏差未超出 eps 理论上界 "
+        f"({rms_bound:.2e} <= 0)——原宣称「RMS 恒为 1」不精确，eps=1e-8 "
+        f"平滑项使偏差达 2.67e-08，已修正为精确命题而非放宽阈值凑绿；"
+        f"B4 CE 全忽略 loss={_l22:.1f} "
+        f"梯度全零={b4_ok}。P3-P6 原宣称「门禁复检」但无门禁，本门禁补齐",
+        p3=p3_worst, p4=p4_worst, p4_ctrl=p4_ctrl, p5=p5_dev,
+        p6=p6_worst, p6_nan=p6_nan, b1=b1_ok, b2=b2_ok,
+        rms_closed=rms_closed, rms_bound=rms_bound, b3=b3_ok, b4=b4_ok)
     R.results[-1].seconds = time.time() - t0
 
     return R

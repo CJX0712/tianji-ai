@@ -103,7 +103,7 @@ the quick brown fox. to be or not to be,
 | **L7** | 训练 | 余弦 / WSD 调度、梯度累积、梯度裁剪、bits-per-byte 度量 |
 | **L8** | 推理 | KV 状态缓存、per-channel INT8 / group-wise INT4、MTP 投机解码 |
 | **L9** | 对齐 | DPO / IPO / SimPO / KTO，统一走 `backward(g_logits=...)` 入口 |
-| **L10** | 微指令 + 门禁 | **1024 条可执行微指令**（32 家族 × 32）+ 21 道交付门禁 |
+| **L10** | 微指令 + 门禁 | **1024 条可执行微指令**（32 家族 × 32）+ 22 道交付门禁 |
 
 完整推导与逐层详解见 [ARCHITECTURE.md](ARCHITECTURE.md)。
 
@@ -145,6 +145,7 @@ Pre-RMSNorm → Mixer(GDN 或 MLA) → 残差 → Pre-RMSNorm → FFN(MoE 或 De
 | G19 优化器不变性 | O1/O3-O7 全机检 + 对抗 fuzz：NS 奇异值精确命题（σ_max 恒落 (0.5,1.5)；5 步+cond≤100 全谱落带——原绝对化宣称被本门禁证伪已修正）、AdamW 解耦 WD 梯度尺度不变、Muon Nesterov 真实 vs Muon2 无变体（曾抓出 `P=P+β·P` 死代码：常数缩放被 NS 归一擦除的假功能）、NaN/Inf 梯度守卫（曾静默污染全参数，修复为 GradScaler 语义跳过）、clip 全局语义、AdamW 首步解析、凸问题单调、确定性 | 0 失败 |
 | G20 持久化完整性 | P1-P7 全机检 + 损坏注入：无扩展名路径 save→load→info 闭环（曾抓出 np.savez 自动追加 .npz 致 _sha256_file 找错文件 FileNotFoundError，已修复规范化）、截断 meta 双路径必须 CheckpointError（曾漏出 JSONDecodeError）、损坏权重 sha 失配、sha 同步篡改被指纹抓住、原子落盘（模拟崩溃无半成品+旧件完好，对齐 safetensors tmp+rename）、空参数/怪异参数名/dtype 保持、保存确定性+失配检出 | 0 失败 |
 | G21 数据管道 | D1-D4+T1 全机检 + 边界对抗：构造期响亮校验（曾抓出数据过短时 max(n,1) 静默钳制 → x/y batch 形状悄悄错位）、token 范围守卫（曾抓出负 token 被 numpy 静默回绕到词表末行——实测全 -1 输入 loss==0，模型「完美学会」垃圾）、y 对齐+切片指纹重放、确定性、T1 调度器端点+单调（l7_train 原宣称「门禁复检」但门禁不存在——与 G19 的 N3 同型宣称失配，已补齐）、梯度累积等价 accum=k==同 seed 重放 k batch 手动平均（逐位一致） | 0 失败 |
+| G22 原语不变性 | P3-P6 首次全部机检（宣称「门禁复检」但 4 条全无，已补齐）+ 边界守卫：RoPE 保范（含 20000 长度外推、1e-6~1e6 量级，1.63e-16）、相对位置性质（带非恒真性对照：位置差使内积变化 4.02e+00，否则恒等 RoPE 也能骗过门禁）、因果性（扰动未来不影响过去，0.00e+00）、注意力行和（4 组 GQA 组合，2.22e-16）；曾抓出「causal_mask_rect(Tq>Tk) 全 -inf 行 → softmax 0/0 → attention 静默 NaN 16/40」与「rope_tables 奇数维拼出 dim−1 表且构造阶段不报错」两个真实缺陷；P2「RMSNorm 输出 RMS 恒为 1」证伪（eps=1e-8 平滑项致偏差 2.67e-08），修正为精确闭式命题而非放宽阈值 | 0 失败 |
 
 **门禁的态度：失败就如实报失败，不允许放宽阈值凑绿。**
 
@@ -171,7 +172,7 @@ Pre-RMSNorm → Mixer(GDN 或 MLA) → 残差 → Pre-RMSNorm → FFN(MoE 或 De
 | A12 | 推理吞吐 | > 50 tok/s | **465 tok/s** |
 | A13 | 运行时依赖 | == 1 | **`['numpy']`** |
 | A14 | 单元测试 | 41/41 | **41/41** |
-| A15 | 交付门禁 | 21/21 | **21/21** |
+| A15 | 交付门禁 | 22/22 | **22/22** |
 | A16 | 断网可运行 | 0 处网络依赖 | **0** |
 
 三条判据的设定依据（A3 为何是 10%、A7 为何用权重误差、A8 为何放宽到 15%）
@@ -201,7 +202,7 @@ python scripts/quickstart.py          # 最小示例，约 10 秒
 2. 模型   4 层 布局=LLLA (A=MLA, L=GatedDeltaNet)，参数 252,032
 4. 训练   30 步 2.4s，loss 6.8636 -> 0.2036
 6. 生成   结果='the quick brown fox jumps over the lazy dog. ...'
-7. 门禁   21/21 通过
+7. 门禁   22/22 通过
 ✅ 全部通过
 ```
 
@@ -248,8 +249,8 @@ make verify-all        # 测试 + 门禁 + 最小示例（交付自查）
 
 ```bash
 docker build -t tianji:latest .
-docker run --rm tianji:latest gates      # 跑 21 道门禁
-docker run --rm tianji:latest test       # 跑 84 个测试
+docker run --rm tianji:latest gates      # 跑 22 道门禁
+docker run --rm tianji:latest test       # 跑 91 个测试
 
 docker compose run --rm tianji train     # 训练，产物落在 ./runs
 docker compose run --rm tianji generate  # 推理
@@ -286,8 +287,8 @@ python bench/run_bench.py --steps 120 --seed 0     # 约 2 分钟，写 bench/re
 
 ```bash
 make help          # 查看全部目标
-make test          # 84 个单元测试
-make gates         # 21 道交付门禁
+make test          # 91 个单元测试
+make gates         # 22 道交付门禁
 make bench         # 完整基准
 make quickstart    # 最小示例
 make train         # 训练
@@ -364,7 +365,7 @@ NumPy 2.5.4 纯 CPU、合成 2 阶马尔可夫语料（vocab=64）、d_model=64 
 | 训练 | ✅ CPU 可训 | ✅ GPU | ❌ | ✅ GPU |
 | 量化 / 投机解码 | ✅ | ❌ | ✅ | ❌ |
 | 对齐（DPO 等） | ✅ | ❌ | ❌ | ❌ |
-| **可证门禁** | **✅ 21 道** | ❌ | ❌ | 部分 |
+| **可证门禁** | **✅ 22 道** | ❌ | ❌ | 部分 |
 | 吞吐 | 低（NumPy CPU） | 高 | 极高 | 极高 |
 
 **诚实的结论**：本项目**不追求吞吐**。它的对标对象是「正确性可独立验证的研究级实现」，
@@ -468,7 +469,7 @@ tianji-ai/
 │   ├── model.py               3:1 混合模型组装
 │   ├── persist.py             checkpoint 保存/加载：sha256+指纹校验、路径规范化、原子落盘
 │   ├── data.py                内置离线语料
-│   ├── verify.py              21 道交付门禁
+│   ├── verify.py              22 道交付门禁
 │   └── cli.py                 命令行入口
 ├── scripts/
 │   ├── reproduce.sh             一键复现（Linux / macOS，无需 Docker）
@@ -480,7 +481,7 @@ tianji-ai/
 │   └── test_model.py            模型配置冒烟
 ├── docs/
 │   └── API.md                   完整 API 说明（L0–L10 全部接口）
-├── tests/test_all.py          84 个单元测试
+├── tests/test_all.py          91 个单元测试
 ├── bench/                     基准脚本 + 结果（bench.json）
 ├── Dockerfile                 一键环境（python:3.11-slim）
 ├── docker-compose.yml         挂载 ./runs 的训练/推理
