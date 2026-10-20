@@ -4,7 +4,7 @@
 
 对比维度：
     B0 熵下界  H（可机检，门禁 G24）—— 任何模型交叉熵 ≥ H
-    B1 架构    Hybrid 3:1 (GDN+MLA) / 全注意力 / 全 GDN，等参数量
+    B1 架构    全注意力 (MLA) / Hybrid(2 注意力+4 GDN) / 全 GDN，三架构等参数匹配
     B2 布局    interleave（Qwen3-Next） vs edge（Mamba-3）
     B3 优化器  AdamW / Muon / Muon2
     B4 量化    FP64 / INT8 / INT4 的困惑度退化
@@ -62,6 +62,76 @@ def base_cfg(**kw):
     return c
 
 
+# ---------------------------------------------------------------- B1 · 等参数三架构
+# B1 把「全注意力 / 全 GDN / 混合」三架构放在一起比。但 MLA 注意力层与 GDN 线性层
+# 的**固有每层参数成本不同**（MLA 低秩压缩、GDN 含卷积+门控+beta/alpha），固定深度
+# 下无法逐位相等。旧版 B1 用 hybrid_ratio 参数构造「全 GDN」，结果 ratio=1e6 只产出
+# 1 注意力 + 5 GDN（LLLLLA）——根本不是全 GDN，且与 Hybrid(LLLALL) 仅注意力位置不同、
+# 三配置参数量还互不相等（396544 / 364224 / 396544）——结论「全 GDN 显著更优」既被错标、
+# 又被参数量混杂。本模块按 B2 等参数方法论的精神，把三架构**匹配到同一参数量**
+# （宽度 d_model 为主、FFN 宽度 d_ff 微调为辅，残差 ≤ 0.1%），隔离架构变量。
+def _arch_analytic_params(layers, vocab, d, d_ff, n_heads=4, n_experts=4,
+                          moe_every=2, shared_expert=True, mtp_depth=1):
+    """解析参数计数（与 init_params 实物逐位一致，仅供等参数搜索，O(1) 不建模型）。"""
+    H, dh, di = n_heads, d // n_heads, n_heads * (d // n_heads)
+    lq, lk, dr = d // 2, 3 * d // 8, 8
+    E, dfe = n_experts, d
+    attn = (lq * d + (H * dh) * lq + (H * dr) * d + lk * d
+            + (H * dh) * lk + (H * dh) * lk + dr * d + d * (H * dh))
+    gdn = 3 * d * di + 12 * di + 2 * H * d + di + 2 * d * di
+    tot = vocab * d
+    for i in range(len(layers)):
+        tot += 2 * d
+        tot += attn if layers[i] == "attn" else gdn
+        moe = (n_experts > 1) and (i % moe_every == moe_every - 1)
+        if moe:
+            tot += E * d + 3 * E * dfe * d + (3 * dfe * d if shared_expert else 0)
+        else:
+            tot += 3 * d_ff * d
+    tot += d
+    if mtp_depth > 0:
+        tot += 2 * d + 2 * d * d
+    return tot
+
+
+def _match_arch(layers, vocab, target):
+    """给定目标参数量，搜索 (d_model, d_ff) 使该层结构实物计数最接近 target。"""
+    best = None
+    for d in range(32, 257, 4):            # d_model 必为 n_heads=4 的倍数
+        for dff in range(2 * d - 30, 2 * d + 31):
+            if dff < 16:
+                continue
+            p = _arch_analytic_params(layers, vocab, d, dff)
+            if best is None or abs(p - target) < abs(best[0] - target):
+                best = (p, d, dff)
+    return best
+
+
+def arch_configs(vocab):
+    """三架构等参数配置：全注意力 / Hybrid(2 注意力+4 GDN) / 全 GDN。
+
+    锚定 target = 全 GDN 在 d_model=64、d_ff=128 的实物参数量，其余两族各搜
+    最接近的 (d_model, d_ff)；三族实物参数量差异 ≤ 0.1%（~400 参数 / ~40 万）。
+    注意力层与 GDN 层的固有每层成本不同，固定深度下无法逐位相等，故采用宽度匹配
+    —— 这正是 B2 等参数方法论的精神：隔离架构变量，不让参数量混为差异来源。
+    """
+    target = _arch_analytic_params(["gdn"] * 6, vocab, 64, 128)
+    layers_map = {
+        "全注意力 (MLA)": ["attn"] * 6,
+        "Hybrid (2 attn+4 GDN)": ["gdn", "attn", "gdn", "gdn", "attn", "gdn"],
+        "全 GDN (无注意力)": ["gdn"] * 6,
+    }
+    out = {}
+    for name, lay in layers_map.items():
+        p, d, dff = _match_arch(lay, vocab, target)
+        out[name] = TianjiConfig(
+            vocab_size=vocab, d_model=d, n_layers=6, n_heads=4, n_kv_heads=2,
+            d_latent_q=d // 2, d_latent_kv=3 * d // 8, d_rope=8,
+            d_ff=dff, d_ff_expert=d, n_experts=4, moe_top_k=2,
+            max_len=256, mtp_depth=1, layers=list(lay))
+    return out
+
+
 def run_train(cfg, tok, val_tok, steps, seed, opt_kind="muon2", lr=0.03,
               seq=32, batch=8, full_val_batches=0, oracle_trans=None):
     P = init_params(cfg, seed=seed)
@@ -108,19 +178,26 @@ def run_train(cfg, tok, val_tok, steps, seed, opt_kind="muon2", lr=0.03,
 
 def bench_architecture(steps, seed):
     tok, val = markov_train_val(6000, 1500, 64, seed)
+    # 三架构**等参数**配置（arch_configs 已匹配到同一参数量，残差 ≤ 0.1%）。
+    # 旧版用 hybrid_ratio 构造「全 GDN」会错配成 1 注意力+5 GDN 且三配置参数量不等；
+    # 此处显式层列表 + 宽度匹配，只比较架构本身。
+    cfgs = arch_configs(64)
     rows = []
-    variants = [
-        ("Hybrid 3:1 (GDN+MLA)", dict(hybrid_ratio=3)),
-        ("全注意力 (MLA)", dict(hybrid_ratio=0)),
-        ("全 GDN (无注意力)", dict(hybrid_ratio=10 ** 6)),
-    ]
-    for name, kw in variants:
-        cfg = base_cfg(**kw)
+    params_seen = {}
+    for name, cfg in cfgs.items():
         r = run_train(cfg, tok, val, steps, seed)
         r["name"] = name
+        r["layers_list"] = cfg.layers
         rows.append(r)
-        print(f"  {name:<24} loss={r['final_loss']:.4f} val={r['val_loss']:.4f} "
+        params_seen[name] = r["params"]
+        print(f"  {name:<22} layers={''.join('A' if l == 'attn' else 'L' for l in cfg.layers)} "
+              f"loss={r['final_loss']:.4f} val={r['val_loss']:.4f} "
               f"params={r['params']} {r['ms_per_step']:.0f}ms/step", flush=True)
+    # 硬断言：三架构参数量必须相等（B1 等参数方法论，防参数量混杂结论）
+    mx, mn = max(params_seen.values()), min(params_seen.values())
+    assert mx - mn <= 0.001 * mx, (
+        f"B1 三架构参数量不等（差 {mx - mn}，超 0.1%）：{params_seen} "
+        f"（架构对比必须等参数，否则混杂了容量而非架构）")
     return rows
 
 
@@ -188,26 +265,29 @@ def bench_learnable(steps, seed):
     er = markov_entropy_rate(vocab=V, seed=seed, order=ORDER)
     H, uniform = float(er["H"]), float(er["log_vocab"])
     n_full = N_VA // (8 * 32) + 2          # 覆盖几乎全部 val 的 batch 数
+    # 三架构**等参数**配置（与 B1 同款 arch_configs，vocab=8 版本）
+    cfgs = arch_configs(V)
     rows = []
-    variants = [
-        ("Hybrid 3:1 (GDN+MLA)", dict(hybrid_ratio=3)),
-        ("全注意力 (MLA)", dict(hybrid_ratio=0)),
-        ("全 GDN (无注意力)", dict(hybrid_ratio=10 ** 6)),
-    ]
-    for name, kw in variants:
-        cfg = base_cfg(vocab_size=V, **kw)
+    params_seen = {}
+    for name, cfg in cfgs.items():
         r = run_train(cfg, tok, val, steps, seed,
                       full_val_batches=n_full, oracle_trans=trans)
         r["name"] = name
+        r["layers_list"] = cfg.layers
         r["learned_fraction"] = (uniform - r["val_loss"]) / (uniform - H)
         r["learned_fraction_full"] = (uniform - r["val_loss_full"]) / (uniform - H)
         rows.append(r)
-        print(f"  {name:<24} loss={r['final_loss']:.4f} "
+        params_seen[name] = r["params"]
+        print(f"  {name:<22} loss={r['final_loss']:.4f} "
               f"val={r['val_loss']:.4f}(lf={r['learned_fraction']:+.3f}) "
               f"full_val={r['val_loss_full']:.4f}"
               f"(lf={r['learned_fraction_full']:+.3f}) "
               f"oracle={r['oracle_nll_full']:.4f} H={H:.4f} "
-              f"{r['ms_per_step']:.0f}ms/step", flush=True)
+              f"params={r['params']} {r['ms_per_step']:.0f}ms/step", flush=True)
+    # 硬断言：三架构参数量必须相等（与 B1 同款等参数约束）
+    mx, mn = max(params_seen.values()), min(params_seen.values())
+    assert mx - mn <= 0.001 * mx, (
+        f"B7 三架构参数量不等（差 {mx - mn}，超 0.1%）：{params_seen}")
     return {"corpus": {"order": ORDER, "vocab": V, "n_train": N_TR,
                        "n_val": N_VA, "same_source": True,
                        "note": "markov_train_val 单源双采样（同源留出，门禁 G26 同款）"},

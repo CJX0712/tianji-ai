@@ -175,6 +175,11 @@
                     markov_train_val 只抽一次转移矩阵、采两条独立序列。门禁 E1 断言同源 val
                     的 oracle NLL≈H，E2 以「不同源 ⇒ NLL 显著>H」作反证对照，证明对该 bug
                     敏感、能抓住回归
+    G27 B1 架构等参数+标注 把 B2 等参数方法论推广到 B1：机检 B1 三架构（全注意力 /
+                    全 GDN / 混合）标注正确（「全 GDN」确为全 gdn，曾因 hybrid_ratio=1e6
+                    错配成 1 注意力+5 GDN）、三种结构齐备、且三配置参数量在 0.1% 内相等——
+                    隔离架构变量，不让参数量混为差异来源（旧版三配置参数量互不相等
+                    396544/364224/396544，结论「全 GDN 显著更优」被错标+参数量混杂）
 """
 
 from __future__ import annotations
@@ -1965,6 +1970,52 @@ def run_all_gates(seed: int = 0, steps: int = 60, verbose: bool = True) -> GateR
         f"指标失效、把「能学会」误判成「学不会」）",
         val_oracle_nll=float(_nll_same), H=float(_H26),
         diff_source_nll=float(_nll_diff), same_source=bool(e1))
+    R.results[-1].seconds = time.time() - t0
+
+    # ---- G27 · B1 架构等参数 + 正确标注（防回归：抓「全 GDN」错标与参数量混杂） ----
+    # 为什么需要：旧版 B1 用 hybrid_ratio=1e6 构造「全 GDN」，结果只产出 1 注意力 +
+    # 5 GDN（LLLLLA）——根本不是全 GDN，且与 Hybrid(LLLALL) 仅注意力位置不同、三配置
+    # 参数量还互不相等（396544 / 364224 / 396544）。结论「全 GDN 显著更优」既被错标、
+    # 又被参数量混杂（全注意力少了 32k 参数，其较差表现可能只是容量而非架构）。本门禁
+    # 把 B2 等参数方法论推广到 B1，机检：(a) B1 三配置标注正确——「全 GDN」确为全 gdn、
+    # 「全注意力」确为全 attn、第三者为混合（Hybrid）；(b) 三配置互不等价结构、恰好覆盖
+    # 全注意力/混合/全 GDN 三种；(c) 三配置参数量在 0.1% 内相等——只比较架构本身。
+    t0 = time.time()
+    import json as _json27, os as _os27
+    _bj27 = _os27.path.join(_os27.path.dirname(__file__), "..", "bench", "results", "bench.json")
+    _ok27 = True
+    _det27 = "bench.json 不存在，跳过（运行 `python bench/run_bench.py` 后机检 B1 等参数/标注）"
+    if _os27.path.exists(_bj27):
+        with open(_bj27, encoding="utf-8") as f:
+            _b27 = _json27.load(f)
+        _ar = _b27.get("architecture", [])
+        if len(_ar) == 3 and all("layers_list" in r and "params" in r for r in _ar):
+            _layers_map = {}
+            for r in _ar:
+                _lay = r["layers_list"]
+                _content = ("all_attn" if all(l == "attn" for l in _lay)
+                            else "all_gdn" if all(l == "gdn" for l in _lay)
+                            else "hybrid")
+                _layers_map[r["name"]] = _content
+            # 标注正确：每个名字与其层结构一致（抓「全 GDN」实为 1 注意力+5 GDN 的错标）
+            _label_ok = all(
+                ("全注意力" in n and c == "all_attn") or
+                ("全 GDN" in n and c == "all_gdn") or
+                ("Hybrid" in n and c == "hybrid")
+                for n, c in _layers_map.items())
+            # 三种结构齐备：必须恰好覆盖 all_attn / all_gdn / hybrid
+            _cover_ok = set(_layers_map.values()) == {"all_attn", "all_gdn", "hybrid"}
+            _params = [int(r["params"]) for r in _ar]
+            _pmx, _pmn = max(_params), min(_params)
+            _peq = (_pmx - _pmn) <= 0.001 * _pmx
+            _ok27 = bool(_label_ok and _cover_ok and _peq)
+            _det27 = (f"B1 三配置=命名→层结构 {_layers_map}；标注正确={_label_ok}；"
+                      f"三种结构齐备={_cover_ok}；参数量 max-min={_pmx - _pmn} "
+                      f"（≤0.1%={_peq}，B2 等参数方法论推广到 B1）")
+        else:
+            _ok27 = False
+            _det27 = f"B1 段需 3 个含 layers_list/params 的配置，实得 {len(_ar)} 个"
+    add("B1 架构等参数+标注", _ok27, _det27, b1_equal_param=bool(_ok27))
     R.results[-1].seconds = time.time() - t0
 
     return R

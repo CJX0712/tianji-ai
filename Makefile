@@ -20,7 +20,7 @@ install:         ## 安装依赖（含 dev）
 test:            ## 跑单元测试（95 个）
 	$(PY) -m pytest tests/ -q --no-header
 
-gates:           ## 跑 26 道交付门禁
+gates:           ## 跑 27 道交付门禁
 	$(PY) -m tianji.cli gates
 
 bench:           ## 跑完整基准（约 7 分钟，含 B7 对照臂）
@@ -55,7 +55,7 @@ docker-shell:    ## 进入容器交互环境
 
 verify-all: test gates quickstart    ## 交付前自查：测试 + 门禁 + 最小示例
 	@echo ""
-	@echo "✅ 自查完成：单元测试、26 道门禁、最小可运行示例"
+	@echo "✅ 自查完成：单元测试、27 道门禁、最小可运行示例"
 
 clean:           ## 清理临时产物
 	rm -rf .pytest_cache runs/quickstart bench/results/*.json

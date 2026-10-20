@@ -14,37 +14,61 @@
   },
   "architecture": [
     {
-      "params": 396544,
-      "layers": "LLLALL",
-      "final_loss": 4.314504642635978,
-      "best_loss": 4.207638883303518,
-      "val_loss": 4.248118121429763,
-      "seconds": 19.891464233398438,
-      "tokens_per_s": 1544.3810289450732,
-      "ms_per_step": 165.76220194498697,
-      "name": "Hybrid 3:1 (GDN+MLA)"
-    },
-    {
-      "params": 364224,
+      "params": 403036,
       "layers": "AAAAAA",
-      "final_loss": 4.3530063184604355,
-      "best_loss": 4.166576161229913,
-      "val_loss": 4.270488518641816,
-      "seconds": 11.750030279159546,
-      "tokens_per_s": 2614.4613477708704,
-      "ms_per_step": 97.91691899299622,
-      "name": "全注意力 (MLA)"
+      "final_loss": 4.318005695155748,
+      "best_loss": 4.149447630124868,
+      "val_loss": 4.249260856817379,
+      "seconds": 16.637017011642456,
+      "tokens_per_s": 1846.4848583434386,
+      "ms_per_step": 138.6418084303538,
+      "name": "全注意力 (MLA)",
+      "layers_list": [
+        "attn",
+        "attn",
+        "attn",
+        "attn",
+        "attn",
+        "attn"
+      ]
     },
     {
-      "params": 396544,
-      "layers": "LLLLLA",
-      "final_loss": 4.382315697220887,
-      "best_loss": 4.302707808929418,
-      "val_loss": 4.194387386813636,
-      "seconds": 20.956716299057007,
-      "tokens_per_s": 1465.8785069959797,
-      "ms_per_step": 174.63930249214172,
-      "name": "全 GDN (无注意力)"
+      "params": 402752,
+      "layers": "LALLAL",
+      "final_loss": 4.267096372319641,
+      "best_loss": 4.144818247660375,
+      "val_loss": 4.255588759436868,
+      "seconds": 24.075744152069092,
+      "tokens_per_s": 1275.9730210606967,
+      "ms_per_step": 200.63120126724243,
+      "name": "Hybrid (2 attn+4 GDN)",
+      "layers_list": [
+        "gdn",
+        "attn",
+        "gdn",
+        "gdn",
+        "attn",
+        "gdn"
+      ]
+    },
+    {
+      "params": 403008,
+      "layers": "LLLLLL",
+      "final_loss": 4.458321556332495,
+      "best_loss": 4.41778191467401,
+      "val_loss": 4.197343683159447,
+      "seconds": 27.342413187026978,
+      "tokens_per_s": 1123.5292141139748,
+      "ms_per_step": 227.85344322522482,
+      "name": "全 GDN (无注意力)",
+      "layers_list": [
+        "gdn",
+        "gdn",
+        "gdn",
+        "gdn",
+        "gdn",
+        "gdn"
+      ]
     }
   ],
   "layout": [
@@ -54,9 +78,9 @@
       "final_loss": 4.387516883597048,
       "best_loss": 4.301307172839184,
       "val_loss": 4.2004837182139605,
-      "seconds": 18.843540906906128,
-      "tokens_per_s": 1630.2668459058652,
-      "ms_per_step": 157.02950755755106,
+      "seconds": 24.9837703704834,
+      "tokens_per_s": 1229.598236953601,
+      "ms_per_step": 208.19808642069498,
       "name": "layout=interleave",
       "layout": "interleave",
       "layers_list": [
@@ -74,9 +98,9 @@
       "final_loss": 4.478120097840924,
       "best_loss": 4.365511932953956,
       "val_loss": 4.202734367714971,
-      "seconds": 18.334945678710938,
-      "tokens_per_s": 1675.489010892985,
-      "ms_per_step": 152.7912139892578,
+      "seconds": 21.566130876541138,
+      "tokens_per_s": 1424.455790232457,
+      "ms_per_step": 179.7177573045095,
       "name": "layout=edge",
       "layout": "edge",
       "layers_list": [
@@ -96,9 +120,9 @@
       "final_loss": 4.112131965914079,
       "best_loss": 3.9536202169700894,
       "val_loss": 4.232226687083219,
-      "seconds": 16.735021352767944,
-      "tokens_per_s": 1835.6713954786178,
-      "ms_per_step": 139.4585112730662,
+      "seconds": 19.468304872512817,
+      "tokens_per_s": 1577.949400380173,
+      "ms_per_step": 162.2358739376068,
       "name": "adamw",
       "lr": 0.003
     },
@@ -108,9 +132,9 @@
       "final_loss": 4.487526880183647,
       "best_loss": 4.421367815927619,
       "val_loss": 4.200327257525575,
-      "seconds": 20.273019075393677,
-      "tokens_per_s": 1515.3145116548683,
-      "ms_per_step": 168.94182562828064,
+      "seconds": 23.64295983314514,
+      "tokens_per_s": 1299.3297039287581,
+      "ms_per_step": 197.0246652762095,
       "name": "muon",
       "lr": 0.03
     },
@@ -120,9 +144,9 @@
       "final_loss": 4.314504642635978,
       "best_loss": 4.207638883303518,
       "val_loss": 4.248118121429763,
-      "seconds": 17.636341333389282,
-      "tokens_per_s": 1741.857872859413,
-      "ms_per_step": 146.96951111157736,
+      "seconds": 24.332493782043457,
+      "tokens_per_s": 1262.5093126570653,
+      "ms_per_step": 202.7707815170288,
       "name": "muon2",
       "lr": 0.03
     }
@@ -194,51 +218,75 @@
     "steps": 600,
     "rows": [
       {
-        "params": 392960,
-        "layers": "LLLALL",
-        "final_loss": 1.7410855447439602,
-        "best_loss": 1.5507581563722506,
-        "val_loss": 1.501542305360714,
-        "seconds": 86.35442757606506,
-        "tokens_per_s": 1778.715976835141,
-        "ms_per_step": 143.92404596010843,
-        "val_loss_full": 1.5494254110478032,
-        "oracle_nll_full": 1.544864456826611,
-        "name": "Hybrid 3:1 (GDN+MLA)",
-        "learned_fraction": 1.0984175946457682,
-        "learned_fraction_full": 1.0074058014688383
-      },
-      {
-        "params": 360640,
+        "params": 399228,
         "layers": "AAAAAA",
-        "final_loss": 1.7444404684303216,
-        "best_loss": 1.5502051122509117,
-        "val_loss": 1.5018872729223143,
-        "seconds": 50.02719235420227,
-        "tokens_per_s": 3070.3302098683066,
-        "ms_per_step": 83.37865392367046,
-        "val_loss_full": 1.5488806888517426,
+        "final_loss": 1.7438506080830494,
+        "best_loss": 1.5495849606693444,
+        "val_loss": 1.5030142879803492,
+        "seconds": 63.300256967544556,
+        "tokens_per_s": 2426.530433814102,
+        "ms_per_step": 105.50042827924092,
+        "val_loss_full": 1.5488207906080762,
         "oracle_nll_full": 1.544864456826611,
         "name": "全注意力 (MLA)",
-        "learned_fraction": 1.0977619121055777,
-        "learned_fraction_full": 1.0084411592037925
+        "layers_list": [
+          "attn",
+          "attn",
+          "attn",
+          "attn",
+          "attn",
+          "attn"
+        ],
+        "learned_fraction": 1.0956197857773597,
+        "learned_fraction_full": 1.0085550082636225
       },
       {
-        "params": 392960,
-        "layers": "LLLLLA",
-        "final_loss": 1.742187224945015,
-        "best_loss": 1.551587926125622,
-        "val_loss": 1.5042415292051587,
-        "seconds": 86.39278554916382,
-        "tokens_per_s": 1777.9262356645552,
-        "ms_per_step": 143.98797591527304,
-        "val_loss_full": 1.551961928419474,
+        "params": 399168,
+        "layers": "LALLAL",
+        "final_loss": 1.7435669950049153,
+        "best_loss": 1.5520713086303533,
+        "val_loss": 1.5014873918995717,
+        "seconds": 105.15033268928528,
+        "tokens_per_s": 1460.7657063138488,
+        "ms_per_step": 175.25055448214212,
+        "val_loss_full": 1.5495829663371934,
+        "oracle_nll_full": 1.544864456826611,
+        "name": "Hybrid (2 attn+4 GDN)",
+        "layers_list": [
+          "gdn",
+          "attn",
+          "gdn",
+          "gdn",
+          "attn",
+          "gdn"
+        ],
+        "learned_fraction": 1.0985219690904997,
+        "learned_fraction_full": 1.0071063348990295
+      },
+      {
+        "params": 399424,
+        "layers": "LLLLLL",
+        "final_loss": 1.7392738273093205,
+        "best_loss": 1.5502068620751706,
+        "val_loss": 1.5032959736647808,
+        "seconds": 112.02326083183289,
+        "tokens_per_s": 1371.1438040585276,
+        "ms_per_step": 186.70543471972147,
+        "val_loss_full": 1.5519269558689726,
         "oracle_nll_full": 1.544864456826611,
         "name": "全 GDN (无注意力)",
-        "learned_fraction": 1.0932871587907045,
-        "learned_fraction_full": 1.0025846230780968
+        "layers_list": [
+          "gdn",
+          "gdn",
+          "gdn",
+          "gdn",
+          "gdn",
+          "gdn"
+        ],
+        "learned_fraction": 1.0950843835956399,
+        "learned_fraction_full": 1.0026510956781387
       }
     ]
   },
-  "timestamp": "2026-10-21 00:59:18"
+  "timestamp": "2026-10-21 01:51:00"
 }

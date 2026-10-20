@@ -36,7 +36,7 @@ sys.path.insert(0, os.path.dirname(__file__))
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from tianji.data import markov_train_val, markov_entropy_rate   # noqa: E402
-from run_bench import base_cfg, run_train                        # noqa: E402  （复用 B1-B3 同款协议）
+from run_bench import base_cfg, run_train, arch_configs           # noqa: E402  （复用 B1-B3 同款协议 + B1 等参数配置）
 
 SEEDS = [0, 1, 2, 3, 4]
 STEPS = 120
@@ -47,10 +47,10 @@ PROTOCOL = {"order": ORDER, "vocab": V, "n_train": N_TR, "n_val": N_VA,
             "note": "协议同 B1-B3，只改 seed（源/初始化/batch 顺序同时改变）"}
 
 ARCH_VARIANTS = [
-    ("Hybrid 3:1 (GDN+MLA)", dict(hybrid_ratio=3)),
-    ("全注意力 (MLA)", dict(hybrid_ratio=0)),
-    ("全 GDN (无注意力)", dict(hybrid_ratio=10 ** 6)),
+    "全注意力 (MLA)", "Hybrid (2 attn+4 GDN)", "全 GDN (无注意力)",
 ]
+# B1 三架构用 arch_configs(64) 产出的**等参数**配置（宽度匹配，残差 ≤ 0.1%），
+# 修正旧版 hybrid_ratio=1e6 把「全 GDN」错配成 1 注意力+5 GDN 且三配置参数量不等的 bug。
 # B2 两条等参数量布局：均 2 注意力 + 4 GDN，且注意力层落在 MoE 位置（1/3/5）的
 # 个数一致（各 1 个）⇒ 参数量严格相等，只比较空间排布本身（G27 修复的混杂）。
 LAYOUT_VARIANTS = [
@@ -66,7 +66,14 @@ def _assert_layout_equal_params(rows):
         f"B2 两布局参数量不等（layout 对比必须等参数）：{ps}")
 
 
-def _run_variant(name, kw, opt_kind, lr, seeds, steps):
+def _assert_arch_equal_params(rows):
+    ps = {r["name"]: r["params"] for r in rows}
+    mx, mn = max(ps.values()), min(ps.values())
+    assert mx - mn <= 0.001 * mx, (
+        f"B1 三架构参数量不等（差 {mx - mn}，超 0.1%）：{ps}（架构对比必须等参数）")
+
+
+def _run_variant(name, cfg, opt_kind, lr, seeds, steps):
     """跑一个配置的多个 seed，返回 {name, params, per_seed, mean/std}。"""
     per_seed = []
     logv = float(np.log(V))
@@ -74,8 +81,7 @@ def _run_variant(name, kw, opt_kind, lr, seeds, steps):
         # 每个 seed 是独立马尔可夫源 ⇒ H 随 seed 重算（与训练语料同源）
         H = float(markov_entropy_rate(vocab=V, seed=s, order=ORDER)["H"])
         tok, val = markov_train_val(N_TR, N_VA, V, s, order=ORDER)
-        r = run_train(base_cfg(**kw), tok, val, steps, s,
-                      opt_kind=opt_kind, lr=lr)
+        r = run_train(cfg, tok, val, steps, s, opt_kind=opt_kind, lr=lr)
         lf = (logv - r["val_loss"]) / (logv - H)
         per_seed.append({"seed": s, "final_loss": r["final_loss"],
                          "val_loss": r["val_loss"], "H": H,
@@ -94,19 +100,21 @@ def _run_variant(name, kw, opt_kind, lr, seeds, steps):
 
 
 def family_architecture(seeds, steps):
-    return [_run_variant(n, k, "muon2", 0.03, seeds, steps)
-            for n, k in ARCH_VARIANTS]
+    cfgs = arch_configs(64)
+    rows = [_run_variant(n, cfgs[n], "muon2", 0.03, seeds, steps) for n in ARCH_VARIANTS]
+    _assert_arch_equal_params(rows)
+    return rows
 
 
 def family_layout(seeds, steps):
-    rows = [_run_variant(f"layout={n}", k, "muon2", 0.03, seeds, steps)
+    rows = [_run_variant(f"layout={n}", base_cfg(**k), "muon2", 0.03, seeds, steps)
             for n, k in LAYOUT_VARIANTS]
     _assert_layout_equal_params(rows)
     return rows
 
 
 def family_optimizer(seeds, steps):
-    return [_run_variant(n, {}, n, lr, seeds, steps)
+    return [_run_variant(n, base_cfg(), n, lr, seeds, steps)
             for n, lr in OPT_VARIANTS]
 
 

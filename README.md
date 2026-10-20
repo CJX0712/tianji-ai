@@ -103,7 +103,7 @@ the quick brown fox. to be or not to be,
 | **L7** | 训练 | 余弦 / WSD 调度、梯度累积、梯度裁剪、bits-per-byte 度量 |
 | **L8** | 推理 | KV 状态缓存、per-channel INT8 / group-wise INT4、MTP 投机解码 |
 | **L9** | 对齐 | DPO / IPO / SimPO / KTO，统一走 `backward(g_logits=...)` 入口 |
-| **L10** | 微指令 + 门禁 | **1024 条可执行微指令**（32 家族 × 32）+ 26 道交付门禁 |
+| **L10** | 微指令 + 门禁 | **1024 条可执行微指令**（32 家族 × 32）+ 27 道交付门禁 |
 
 完整推导与逐层详解见 [ARCHITECTURE.md](ARCHITECTURE.md)。
 
@@ -150,6 +150,7 @@ Pre-RMSNorm → Mixer(GDN 或 MLA) → 残差 → Pre-RMSNorm → FFN(MoE 或 De
 | G24 基准熵下界 | E1 熵率自洽（2 阶马尔可夫源 H 由解析平稳分布法与 oracle 交叉熵法两套独立算法算出，差<5e-3，0<H<log(vocab)）+ E2 损失不破下界护栏（未训练模型验证 CE ≥ H，sub-entropy 即 loss bug）+ E3a 基准诚实性（读 bench.json 断言主基准各配置 learned fraction ≤ 1，最大 −0.032 即无任何配置学会语料；**并断言 B2 布局段两配置参数量必须相等**——G27 修复的混杂：旧版 interleave/edge 注意力层数漂移导致参数量不等）+ E3b 基准判别力（B7 可学性对照臂：一阶 vocab=8 同源语料上 lf_full>0.5 且模型全量 val 与同序列 oracle 差<0.05——证明基准不是永远学不会的钝器）+ E3c 多 seed 稳定性（B8：5 seed × 3 族，断言已记录 per-seed lf ≤ 1，并对账每族最优配置与「是否每个 seed 都由它获胜」，锁定 B1 排序可复现 / B2 等参数修正后 edge 显著更优，见 BENCHMARKS.md B8） | H=3.0356 nats |
 | G25 全模型反向一致性 | 完整模型（GDN+MLA+MoE+MTP 装配）解析反向 vs 中心差分：抽样 336 条目最大混合比值 2.49e-03（判据 \|a−n\|≤atol+rtol·\|n\|，≤1 即过）—— G2 只校验独立原语反向，本门禁补齐 model.py 把它们装配成完整 Transformer 后的端到端反向（残差顺序/Pre-Norm/MoE 路由/MTP 头梯度），抓住「会训练却永远训不好」的阴险接线 bug | 2.49e-03 |
 | G26 基准 train/val 同源 | 机检基准语料 train/val 是否同源（修一个曾污染全基准的 bug）：markov_tokens 每次调用都重抽转移矩阵，旧 run_bench 用 seed 与 seed+7 分别生成 train/val ⇒ 竟是两个不同马尔可夫源，val 永远到不了 H、learned fraction 失效（把「能学会」误判成「学不会」）。修复：markov_train_val 只抽一次转移矩阵、采两条独立序列。E1 断言同源 val 的 oracle NLL≈H（3.0369 vs 3.0356），E2 以「不同源 ⇒ NLL 显著>H（6.96）」反证对照，证明对该 bug 敏感、能抓回归 | 同源 |
+| G27 B1 架构等参数+标注 | 把 B2 等参数方法论推广到 B1：机检 B1 三架构（全注意力/Hybrid/全 GDN）命名→层结构标注正确、三种结构齐备、参数量在 0.1% 内相等——抓住「全 GDN」错标（实为 1 注意力+5 GDN）与参数量混杂（旧版 396,544/364,224/396,544）的回归 | 标注✅ 等参数✅ |
 
 **门禁的态度：失败就如实报失败，不允许放宽阈值凑绿。**
 
@@ -175,8 +176,8 @@ Pre-RMSNorm → Mixer(GDN 或 MLA) → 残差 → Pre-RMSNorm → FFN(MoE 或 De
 | A11 | checkpoint 往返 | 逐位一致 + 损坏拦截 | **均 True** |
 | A12 | 推理吞吐 | > 50 tok/s | **465 tok/s** |
 | A13 | 运行时依赖 | == 1 | **`['numpy']`** |
-| A14 | 单元测试 | 41/41 | **41/41** |
-| A15 | 交付门禁 | 26/26 | **26/26** |
+| A14 | 单元测试 | 95/95 | **95/95** |
+| A15 | 交付门禁 | 27/27 | **27/27** |
 | A16 | 断网可运行 | 0 处网络依赖 | **0** |
 
 三条判据的设定依据（A3 为何是 10%、A7 为何用权重误差、A8 为何放宽到 15%）
@@ -206,7 +207,7 @@ python scripts/quickstart.py          # 最小示例，约 10 秒
 2. 模型   4 层 布局=LLLA (A=MLA, L=GatedDeltaNet)，参数 252,032
 4. 训练   30 步 2.4s，loss 6.8636 -> 0.2036
 6. 生成   结果='the quick brown fox jumps over the lazy dog. ...'
-7. 门禁   26/26 通过
+7. 门禁   27/27 通过
 ✅ 全部通过
 ```
 
@@ -253,7 +254,7 @@ make verify-all        # 测试 + 门禁 + 最小示例（交付自查）
 
 ```bash
 docker build -t tianji:latest .
-docker run --rm tianji:latest gates      # 跑 26 道门禁
+docker run --rm tianji:latest gates      # 跑 27 道门禁
 docker run --rm tianji:latest test       # 跑 95 个测试
 
 docker compose run --rm tianji train     # 训练，产物落在 ./runs
@@ -293,7 +294,7 @@ python bench/run_multiseed.py --steps 120          # 约 6 分钟（B8：5 seed 
 ```bash
 make help          # 查看全部目标
 make test          # 95 个单元测试
-make gates         # 26 道交付门禁
+make gates         # 27 道交付门禁
 make bench         # 完整基准（约 7 分钟）
 make multiseed     # B8 多 seed 稳定性（约 6 分钟）
 make quickstart    # 最小示例
@@ -312,18 +313,26 @@ make verify-all    # 交付前自查
 NumPy 2.5.4 纯 CPU、合成 2 阶马尔可夫语料（vocab=64）、d_model=64 / 6 层 / MoE(4专家 top-2)、
 120 步、batch=8、seq=32。
 
-### B1 · 架构对比
+### B1 · 架构对比（三架构**等参数匹配**，G27 修复错标与参数量混杂）
 
-| 架构 | 参数量 | 训练 loss | **验证 loss** | ms/步 |
-|---|---:|---:|---:|---:|
-| Hybrid 3:1（GDN + MLA） | 396,544 | 4.3145 | 4.2481 | 180 |
-| 全注意力（MLA） | 364,224 | 4.3530 | 4.2705 | 99 |
-| 全 GDN（无注意力层） | 396,544 | 4.3823 | **4.1944** | 177 |
+> ⚠️ **G27 修复了 B1 的「全 GDN」错标与参数量混杂**：旧版用 `hybrid_ratio=1e6` 构造
+> 「全 GDN」，结果只产出 1 注意力 + 5 GDN（LLLLLA）—— 根本不是全 GDN，且与 Hybrid(LLLALL)
+> 仅注意力位置不同、三配置参数量还互不相等（396,544 / 364,224 / 396,544）。现按 B2 等参数
+> 方法论把三架构**匹配到同一参数量**（残差 ≤ 0.1%，门禁 G27 机检），只比较架构本身。
 
-验证损失上全 GDN 最低（4.1944）、Hybrid 次之（4.2481）、全注意力最高（4.2705）；
-但三者 learned fraction 均为负（没有一个真正学会语料），且**相对排序在 train/val 同源修复后
-发生了翻转**（旧 bug 版是 Hybrid 最优）——证明这些微小差异是噪声/方法论假象，
-**不能用于架构优劣论断**。真正的收益在 B5。
+| 架构 | 层结构 | 参数量 | 训练 loss | **验证 loss** | ms/步 |
+|---|---|---:|---:|---:|---:|
+| 全注意力（MLA） | AAAAAA | 403,036 | 4.3180 | 4.2493 | 139 |
+| Hybrid（2 注意力 + 4 GDN） | LALLAL | 402,752 | 4.2671 | 4.2556 | 201 |
+| 全 GDN（无注意力层） | LLLLLL | 403,008 | 4.4583 | **4.1973** | 228 |
+
+验证损失上**全 GDN 最低（4.1973）**、全注意力次之（4.2493）、Hybrid 最差（4.2556）—— 与 B8
+多 seed 实测一致：全 GDN 在 **5/5 seed** 上最优（配对 t=+5.22 vs 全注意力、t=+7.00 vs Hybrid，
+均 0:5 全胜），**「全 GDN 显著更优」是真信号**，且修正错标与等参数后更干净（旧版错标的
+「全 GDN」实为 1 注意力 + 5 GDN）。但三者 learned fraction 仍均为负（−0.028 ~ −0.091，
+见 BENCHMARKS.md），**没有一个真正学会语料**，差异只是「离 uniform 多远」的系统性归纳偏置
+差别（效应量 ≈ 0.07 nats，相对 1.7%），规模仅 40 万参数 / 120 步，**不可外推到真实大模型规模**。
+真正的结构性收益仍在 B5（KV cache 砍掉 83%）。
 
 ### B5 · KV cache（本架构最硬的收益）
 
@@ -415,7 +424,7 @@ lf≈+1.0，模型与真实源 oracle 差仅 0.004~0.007 nats（门禁 G24·E3b 
 | 训练 | ✅ CPU 可训 | ✅ GPU | ❌ | ✅ GPU |
 | 量化 / 投机解码 | ✅ | ❌ | ✅ | ❌ |
 | 对齐（DPO 等） | ✅ | ❌ | ❌ | ❌ |
-| **可证门禁** | **✅ 26 道** | ❌ | ❌ | 部分 |
+| **可证门禁** | **✅ 27 道** | ❌ | ❌ | 部分 |
 | 吞吐 | 低（NumPy CPU） | 高 | 极高 | 极高 |
 
 **诚实的结论**：本项目**不追求吞吐**。它的对标对象是「正确性可独立验证的研究级实现」，
@@ -519,7 +528,7 @@ tianji-ai/
 │   ├── model.py               3:1 混合模型组装
 │   ├── persist.py             checkpoint 保存/加载：sha256+指纹校验、路径规范化、原子落盘
 │   ├── data.py                内置离线语料
-│   ├── verify.py              26 道交付门禁
+│   ├── verify.py              27 道交付门禁
 │   └── cli.py                 命令行入口
 ├── scripts/
 │   ├── reproduce.sh             一键复现（Linux / macOS，无需 Docker）
@@ -577,7 +586,7 @@ tianji-ai/
 
 | 检查项 | 结果 |
 |---|---|
-| 单元测试 | ✅ 41 / 41 通过 |
+| 单元测试 | ✅ 95 / 95 通过 |
 | 交付门禁 | ✅ 12 / 12 全绿 |
 | **验收指标** | ✅ **16 / 16 达标**（`scripts/acceptance.py`，47s） |
 | 微指令 | ✅ 1024 / 1024 可执行 |
