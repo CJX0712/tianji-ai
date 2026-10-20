@@ -7,8 +7,8 @@ IMAGE ?= tianji:latest
 
 .DEFAULT_GOAL := help
 
-.PHONY: help install test gates bench quickstart train generate \
-        docker-build docker-test docker-shell clean verify-all
+.PHONY: help install test gates bench multiseed quickstart train \
+        generate docker-build docker-test docker-shell clean verify-all
 
 help:            ## 显示所有可用目标
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) \
@@ -20,11 +20,14 @@ install:         ## 安装依赖（含 dev）
 test:            ## 跑单元测试（95 个）
 	$(PY) -m pytest tests/ -q --no-header
 
-gates:           ## 跑 25 道交付门禁
+gates:           ## 跑 26 道交付门禁
 	$(PY) -m tianji.cli gates
 
-bench:           ## 跑完整基准（约 2 分钟）
+bench:           ## 跑完整基准（约 7 分钟，含 B7 对照臂）
 	$(PY) bench/run_bench.py --steps 120
+
+multiseed:       ## 跑 B8 多 seed 稳定性（5 seed × 3 族，约 6 分钟）
+	$(PY) bench/run_multiseed.py --steps 120
 
 quickstart:      ## 最小可运行示例（约 10 秒）
 	$(PY) scripts/quickstart.py
@@ -52,7 +55,7 @@ docker-shell:    ## 进入容器交互环境
 
 verify-all: test gates quickstart    ## 交付前自查：测试 + 门禁 + 最小示例
 	@echo ""
-	@echo "✅ 自查完成：单元测试、25 道门禁、最小可运行示例"
+	@echo "✅ 自查完成：单元测试、26 道门禁、最小可运行示例"
 
 clean:           ## 清理临时产物
 	rm -rf .pytest_cache runs/quickstart bench/results/*.json

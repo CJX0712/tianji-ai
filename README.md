@@ -147,7 +147,7 @@ Pre-RMSNorm → Mixer(GDN 或 MLA) → 残差 → Pre-RMSNorm → FFN(MoE 或 De
 | G21 数据管道 | D1-D4+T1 全机检 + 边界对抗：构造期响亮校验（曾抓出数据过短时 max(n,1) 静默钳制 → x/y batch 形状悄悄错位）、token 范围守卫（曾抓出负 token 被 numpy 静默回绕到词表末行——实测全 -1 输入 loss==0，模型「完美学会」垃圾）、y 对齐+切片指纹重放、确定性、T1 调度器端点+单调（l7_train 原宣称「门禁复检」但门禁不存在——与 G19 的 N3 同型宣称失配，已补齐）、梯度累积等价 accum=k==同 seed 重放 k batch 手动平均（逐位一致） | 0 失败 |
 | G22 原语不变性 | P3-P6 首次全部机检（宣称「门禁复检」但 4 条全无，已补齐）+ 边界守卫：RoPE 保范（含 20000 长度外推、1e-6~1e6 量级，1.63e-16）、相对位置性质（带非恒真性对照：位置差使内积变化 4.02e+00，否则恒等 RoPE 也能骗过门禁）、因果性（扰动未来不影响过去，0.00e+00）、注意力行和（4 组 GQA 组合，2.22e-16）；曾抓出「causal_mask_rect(Tq>Tk) 全 -inf 行 → softmax 0/0 → attention 静默 NaN 16/40」与「rope_tables 奇数维拼出 dim−1 表且构造阶段不报错」两个真实缺陷；P2「RMSNorm 输出 RMS 恒为 1」证伪（eps=1e-8 平滑项致偏差 2.67e-08），修正为精确闭式命题而非放宽阈值 | 0 失败 |
 | G23 GDN 归一化 | L1-L3 全部机检：**l2norm 单位范数契约** ‖k̂‖==1 对任意 ‖k‖（含 1e-12）成立、零向量→零输出——曾因分母 +1e-8 使 ‖k̂‖ 只剩 0.181（偏差 82%，delta rule 有效写入强度 β‖k̂‖² 被静默缩小到 0.016）；**尺度自适应梯度检验**（gradcheck 固定步长 1e-5 对 ‖k‖~1e-7 输入测量本身失效，已记入 l1_contract 局限）——同一公式配旧前向的相对误差 = eps/(‖k‖+eps)，‖k‖=1e-7 时达 17%；**三路径边界等价** α,β∈{0,0.5,1} × ‖k‖∈{1,1e-7,1e8} × chunk∈{1,3,T,T+5} 共 108 组，最大差 3.06e-16 | 0 失败 |
-| G24 基准熵下界 | E1 熵率自洽（2 阶马尔可夫源 H 由解析平稳分布法与 oracle 交叉熵法两套独立算法算出，差<5e-3，0<H<log(vocab)）+ E2 损失不破下界护栏（未训练模型验证 CE ≥ H，sub-entropy 即 loss bug）+ E3a 基准诚实性（读 bench.json 断言主基准各配置 learned fraction ≤ 1，最大 −0.032 即无任何配置学会语料）+ E3b 基准判别力（B7 可学性对照臂：一阶 vocab=8 同源语料上 lf_full>0.5 且模型全量 val 与同序列 oracle 差<0.05——证明基准不是永远学不会的钝器，见 BENCHMARKS.md B7） | H=3.0356 nats |
+| G24 基准熵下界 | E1 熵率自洽（2 阶马尔可夫源 H 由解析平稳分布法与 oracle 交叉熵法两套独立算法算出，差<5e-3，0<H<log(vocab)）+ E2 损失不破下界护栏（未训练模型验证 CE ≥ H，sub-entropy 即 loss bug）+ E3a 基准诚实性（读 bench.json 断言主基准各配置 learned fraction ≤ 1，最大 −0.032 即无任何配置学会语料）+ E3b 基准判别力（B7 可学性对照臂：一阶 vocab=8 同源语料上 lf_full>0.5 且模型全量 val 与同序列 oracle 差<0.05——证明基准不是永远学不会的钝器）+ E3c 多 seed 稳定性（B8：5 seed × 3 族，断言已记录 per-seed lf ≤ 1，并对账每族最优配置与「是否每个 seed 都由它获胜」，锁定 B1 排序可复现 / B2 不可区分，见 BENCHMARKS.md B8） | H=3.0356 nats |
 | G25 全模型反向一致性 | 完整模型（GDN+MLA+MoE+MTP 装配）解析反向 vs 中心差分：抽样 336 条目最大混合比值 2.49e-03（判据 \|a−n\|≤atol+rtol·\|n\|，≤1 即过）—— G2 只校验独立原语反向，本门禁补齐 model.py 把它们装配成完整 Transformer 后的端到端反向（残差顺序/Pre-Norm/MoE 路由/MTP 头梯度），抓住「会训练却永远训不好」的阴险接线 bug | 2.49e-03 |
 | G26 基准 train/val 同源 | 机检基准语料 train/val 是否同源（修一个曾污染全基准的 bug）：markov_tokens 每次调用都重抽转移矩阵，旧 run_bench 用 seed 与 seed+7 分别生成 train/val ⇒ 竟是两个不同马尔可夫源，val 永远到不了 H、learned fraction 失效（把「能学会」误判成「学不会」）。修复：markov_train_val 只抽一次转移矩阵、采两条独立序列。E1 断言同源 val 的 oracle NLL≈H（3.0369 vs 3.0356），E2 以「不同源 ⇒ NLL 显著>H（6.96）」反证对照，证明对该 bug 敏感、能抓回归 | 同源 |
 
@@ -285,6 +285,7 @@ checkpoint 加载时**强制校验 sha256 与参数指纹**，损坏文件直接
 
 ```bash
 python bench/run_bench.py --steps 120 --seed 0     # 约 7 分钟（含 B7 对照臂），写 bench/results/bench.json
+python bench/run_multiseed.py --steps 120          # 约 6 分钟（B8：5 seed × 3 族），写 bench/results/multiseed.json
 ```
 
 ### 所有命令（Makefile）
@@ -293,7 +294,8 @@ python bench/run_bench.py --steps 120 --seed 0     # 约 7 分钟（含 B7 对�
 make help          # 查看全部目标
 make test          # 95 个单元测试
 make gates         # 26 道交付门禁
-make bench         # 完整基准
+make bench         # 完整基准（约 7 分钟）
+make multiseed     # B8 多 seed 稳定性（约 6 分钟）
 make quickstart    # 最小示例
 make train         # 训练
 make generate      # 推理
@@ -377,6 +379,30 @@ lf≈+1.0，模型与真实源 oracle 差仅 0.004~0.007 nats（门禁 G24·E3b 
 灵敏测量背书；③ 1024-token 子采样上 lf 冲到 +1.098、全量回落到 +1.007，
 量化了 B1-B3 那 ~0.05 nats 差异的噪声量级。详见 [BENCHMARKS.md](BENCHMARKS.md) B7。
 
+### B8 · 多 seed 稳定性（噪声定量）
+
+**要回答的问题**：B1-B3 里那 ~0.04~0.07 nats 的差异，是随机种子噪声还是可复现信号？
+旧版一律判为「噪声内」，但那只是**推断**。本组直接测量：协议与 B1-B3 完全一致、只改 seed，
+每配置跑 seed 0-4，用**配对比较**（同 seed 下两配置之差）算 t 值（df=4）。
+
+| 族 | 最优配置（5 seed 均值） | 每 seed 都由它获胜？ | 关键 t 值 |
+|---|---|---|---|
+| B1 架构 | 全 GDN **4.2066**±0.0161 | **是**（5:0 胜 Hybrid 与全注意力） | GDN vs 全注意力 t=+6.45 |
+| B2 布局 | edge **4.2172**±0.0122 | 否（3:2 险胜） | edge vs interleave t=+1.40（p≈0.23） |
+| B3 优化器 | Muon **4.1843**±0.0137 | **是**（5:0 胜 AdamW 与 Muon2） | Muon vs Muon2 t=−7.17 |
+
+**三族结论各不相同（已按实测更正旧版「一切皆噪声」的推断）**：
+
+- **B1 架构排序可复现**：全 GDN 在 5/5 seed 上验证最优（GDN < Hybrid < 全注意力）。
+  但 lf 仍全为负（−0.042~−0.102）——三者**都没学会**，差异是「离 uniform 多远」的
+  系统性归纳偏置差别，效应量 ≈0.067 nats（相对 1.6%），规模 40 万参数 / 120 步，**不可外推**。
+- **B2 布局确实不可区分**：edge 仅 3:2 险胜，t=1.40（p≈0.23）。
+  ⚠️ 附带发现：两种布局**参数量并不相等**（396,544 vs 390,080）——MoE 按层索引交替放置，
+  注意力层挪到首尾会改变哪些层带 MoE。B2 因此不是严格的参数匹配对比。
+- **B3 优化器：一半是信号**——Muon 稳定最优（5/5 胜过 AdamW 与 Muon2，t≈5.3 / 7.2）；
+  **AdamW ≈ Muon2**（Δ=0.0015，t=0.12，胜负 3:2）不可区分。
+  旧版「Muon2 验证最差、AdamW 次之」只是 seed 0 的抽样现象，已更正。
+
 ### 与现有最优方案的定位对比
 
 | 维度 | **本项目** | nanoGPT | llama.cpp | fla (flash-linear-attention) |
@@ -403,7 +429,7 @@ lf≈+1.0，模型与真实源 oracle 差仅 0.004~0.007 nats（门禁 G24·E3b 
 | **[SPEC.md](SPEC.md)** | 项目定位、核心能力、技术选型对比、**16 项可量化验收指标**与判据依据 |
 | **[docs/API.md](docs/API.md)** | **完整 API 说明**：L0–L10 全部公开接口、参数、返回值与示例 |
 | **[ARCHITECTURE.md](ARCHITECTURE.md)** | 十层架构详解、数学推导、逐层选型与被否决方案、反向传播顺序留档 |
-| **[BENCHMARKS.md](BENCHMARKS.md)** | 7 组基准数据与诚实解读（含一条负面结果、一个可学性对照臂） |
+| **[BENCHMARKS.md](BENCHMARKS.md)** | 8 组基准数据与诚实解读（含一条负面结果、一个可学性对照臂、一组种子噪声定量） |
 | [README.md](README.md) | 本文件：总览、快速开始、复现、性能对比、引用清单 |
 
 ---

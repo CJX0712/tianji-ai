@@ -156,7 +156,10 @@
                     vocab=8 同源语料、同模型规模）lf_full > 0.5 且模型全量 val
                     与同一序列上的真实源 oracle 差 < 0.05 —— 证明基准不是
                     「永远学不会」的钝器：任务在规模内可学时 lf 转正、模型逼近
-                    真实源，B1 的三架构比较在该臂上才有统计意义
+                    真实源，B1 的三架构比较在该臂上才有统计意义；E3c 多 seed
+                    稳定性（B8，5 seed × 3 配置，multiseed.json）—— 已记录
+                    per-seed lf ≤ 1 护栏 + 每 seed 获胜者翻转情况 + 两两
+                    |Δmean|/pooled_std，把「架构差异落在种子噪声内」定性变定量
     G25 全模型反向一致性 完整模型（GDN+MLA+MoE+MTP 装配）解析反向 vs 中心差分
                     （分层抽样：每张量少量均匀点 + 全局随机点，全参数中心差分
                     太慢 ≈190s）：G2 只校验各独立原语反向，本门禁补齐把它们装配成
@@ -1774,7 +1777,58 @@ def run_all_gates(seed: int = 0, steps: int = 60, verbose: bool = True) -> GateR
         arm_ok, arm_best_lf, arm_min_gap = True, 0.0, float("inf")
         honesty_detail = ("bench/results/bench.json 不存在，跳过读取（门禁仍守着 H 自洽"
                          f"与不破下界）；运行 `python bench/run_bench.py` 后可机检 learned fraction")
-    ok24 = bool(er["consistent"] and guard_ok and not over and arm_ok)
+    # E3c · 多 seed 稳定性（bench/results/multiseed.json，B8 生成）：
+    #   ① 与 E3a 同判据作用于新数据（已记录 per-seed lf ≤ 1，护栏）；
+    #   ② 用已记录的 per-seed 数据**重算**每族最优配置与「是否每个 seed 都由
+    #      它获胜」，与文件里记录的 best/consistent 对账，并核对文档宣称的
+    #      排序——把「差异是噪声还是信号」定量化并钉死，防止文档与数据分叉。
+    #   读已记录数据 ⇒ 门禁确定性（不重训，不因随机性抖动）。
+    ms_path = _os.path.join(_os.path.dirname(__file__), "..", "bench", "results",
+                            "multiseed.json")
+    if _os.path.exists(ms_path):
+        with open(ms_path, encoding="utf-8") as f:
+            ms = _json.load(f)
+        fams = {k: v for k, v in ms.get("families", {}).items()
+                if isinstance(v, dict)}
+        ms_lfs = [p["lf"] for fam in fams.values()
+                  for c in fam.get("configs", []) for p in c.get("per_seed", [])]
+        ms_lf_max = max(ms_lfs) if ms_lfs else 0.0
+        ms_tmax = max((abs(p["t"]) for fam in fams.values()
+                       for p in fam.get("pairwise", [])), default=float("nan"))
+        # 文档宣称的排序（B8 实测锁定）：(期望最优配置, 是否每个 seed 都最优)
+        #   layout 期望 consistent=False —— 即「统计上不可区分」本身是待守的声明
+        expected = {"architecture": ("全 GDN (无注意力)", True),
+                    "layout": (None, False),
+                    "optimizer": ("muon", True)}
+        checks, parts = [], []
+        for key, (want_best, want_consistent) in expected.items():
+            fam = fams.get(key)
+            if not fam:
+                checks.append(False)
+                continue
+            rows = fam["configs"]
+            best = min(rows, key=lambda r: r["mean_val"])["name"]
+            consistent = all(
+                min((r["per_seed"][k]["val_loss"], r["name"]) for r in rows)[1] == best
+                for k in range(len(ms.get("seeds", []))))
+            ok_k = (bool(consistent == want_consistent)
+                    and (want_best is None or best == want_best))
+            checks.append(ok_k)
+            parts.append(f"{key}: best={best} consistent={consistent}"
+                         f"{'' if want_best is None else ' (宣称最优=' + str(want_best) + ')'}")
+        ms_ok = bool(ms_lf_max <= 1.0 + 1e-9 and len(checks) == 3
+                       and all(checks))
+        honesty_detail += (
+            f"；E3c 多 seed（{len(ms.get('seeds', []))} seed × 3 族，B8）："
+            f"已记录 per-seed lf 最大 {ms_lf_max:.3f} ≤ 1（护栏）；"
+            f"{'; '.join(parts)}；两两配对 \\|t\\| 最大 {ms_tmax:.2f}"
+            f"（B1 架构排序可复现 ⇒ B8 推翻旧版「一切皆噪声」的推断；"
+            f"B2 布局确实不可区分）")
+    else:
+        ms_ok, ms_lf_max = True, 0.0
+        honesty_detail += ("；E3c multiseed.json 不存在，跳过"
+                           "（运行 `python bench/run_multiseed.py` 后机检种子噪声）")
+    ok24 = bool(er["consistent"] and guard_ok and not over and arm_ok and ms_ok)
     add("基准熵下界", ok24,
         f"E1 熵率自洽：H={H:.4f} nats（解析平稳分布 H_A={er['H_analytic']:.4f} 与 "
         f"oracle 交叉熵 H_B={er['H_oracle']:.4f} 差 {er['abs_diff']:.2e}<{er['tol']:.0e}），"
@@ -1782,7 +1836,8 @@ def run_all_gates(seed: int = 0, steps: int = 60, verbose: bool = True) -> GateR
         f"{ce0:.4f} ≥ H（差 {ce0 - H:+.4f}，sub-entropy 即 bug，本护栏拦截）；E3 {honesty_detail}",
         H=H, H_A=float(er["H_analytic"]), H_B=float(er["H_oracle"]), diff=float(er["abs_diff"]),
         ce0=ce0, max_learned_fraction=float(max_lf),
-        learnable_best_lf=float(arm_best_lf), learnable_min_gap=float(arm_min_gap))
+        learnable_best_lf=float(arm_best_lf), learnable_min_gap=float(arm_min_gap),
+        multiseed_max_lf=float(ms_lf_max))
     R.results[-1].seconds = time.time() - t0
 
     # ---- G25 · 全模型反向一致性（端到端 gradcheck） ----
