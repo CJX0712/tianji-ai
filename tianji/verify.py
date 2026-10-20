@@ -152,7 +152,9 @@
                     (c) 基准诚实性 + 判别力 —— 读 bench/results/bench.json：
                     E3a 主基准各配置 learned fraction = (uniform−loss)/(uniform−H)
                     全部 ≤ 1.0（没有任何配置突破熵下界；当前主基准均远未学会，
-                    见 BENCHMARKS.md 诚实修订）；E3b 可学性对照臂（B7，1 阶
+                    见 BENCHMARKS.md 诚实修订），且 B2 布局段两配置参数量必须
+                    严格相等（G27 修复的混杂：旧版 interleave/edge 注意力层数
+                    漂移导致参数量不等、结论不可信）；E3b 可学性对照臂（B7，1 阶
                     vocab=8 同源语料、同模型规模）lf_full > 0.5 且模型全量 val
                     与同一序列上的真实源 oracle 差 < 0.05 —— 证明基准不是
                     「永远学不会」的钝器：任务在规模内可学时 lf 转正、模型逼近
@@ -1746,10 +1748,19 @@ def run_all_gates(seed: int = 0, steps: int = 60, verbose: bool = True) -> GateR
                     rows.append((r.get("name", "?"), float(r["val_loss"]), _lf(r["val_loss"])))
         max_lf = max((x[2] for x in rows), default=0.0) if rows else 0.0
         over = any(x[2] > 1.0 + 1e-9 for x in rows)
+        # E3a·layout 等参数机检（G27 修复的混杂）：B2 两布局必须严格等参数，
+        # 否则「布局对比」会混杂「注意力层数」这一变量，结论不可信。
+        lay_rows = [r for r in bench.get("layout", []) if "params" in r]
+        layout_params = {r.get("name"): int(r["params"]) for r in lay_rows}
+        layout_eq = (len(set(layout_params.values())) <= 1) if layout_params else True
+        if layout_eq:
+            layout_note = f"相等({layout_params or 'n/a'}) 通过"
+        else:
+            layout_note = f"不等({layout_params or 'n/a'}) 不通过"
         honesty_detail = (f"E3a 读 bench.json：{len(rows)} 个配置的最大 learned fraction="
                          f"{max_lf:.3f}（=(uniform−模型)/(uniform−floor)，1.0=达到熵下界）；"
                          f"全部 ≤ 1 即「没有任何配置突破熵下界」；当前基准均远未学会"
-                         f"（见 BENCHMARKS.md）")
+                         f"（见 BENCHMARKS.md）；E3a·layout 等参数：{layout_note}")
         # E3b · 可学性对照臂（bench.json 的 "learnable" 段，由 B7 生成）
         lv = bench.get("learnable")
         if lv and lv.get("rows") and all(
@@ -1823,12 +1834,12 @@ def run_all_gates(seed: int = 0, steps: int = 60, verbose: bool = True) -> GateR
             f"已记录 per-seed lf 最大 {ms_lf_max:.3f} ≤ 1（护栏）；"
             f"{'; '.join(parts)}；两两配对 \\|t\\| 最大 {ms_tmax:.2f}"
             f"（B1 架构排序可复现 ⇒ B8 推翻旧版「一切皆噪声」的推断；"
-            f"B2 布局确实不可区分）")
+            f"B2 布局经 G27 等参数修正后 edge 显著更优 t≈3.16）")
     else:
         ms_ok, ms_lf_max = True, 0.0
         honesty_detail += ("；E3c multiseed.json 不存在，跳过"
                            "（运行 `python bench/run_multiseed.py` 后机检种子噪声）")
-    ok24 = bool(er["consistent"] and guard_ok and not over and arm_ok and ms_ok)
+    ok24 = bool(er["consistent"] and guard_ok and not over and arm_ok and ms_ok and layout_eq)
     add("基准熵下界", ok24,
         f"E1 熵率自洽：H={H:.4f} nats（解析平稳分布 H_A={er['H_analytic']:.4f} 与 "
         f"oracle 交叉熵 H_B={er['H_oracle']:.4f} 差 {er['abs_diff']:.2e}<{er['tol']:.0e}），"

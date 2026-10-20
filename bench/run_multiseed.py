@@ -12,6 +12,9 @@
 seed 同时改变马尔可夫源、参数初始化与 batch 顺序，即「同一实验换一个随机Draw」。
 H 随 seed 变（每个 seed 是不同转移矩阵），故 learned fraction 用该 seed 自己的 H。
 
+B2 布局族（G27 起）用两条**等参数量**布局（均 2 注意力 + 4 GDN，MoE 重叠一致），
+只比较空间排布本身，不混杂「注意力层数」这一变量。
+
 运行：
     python bench/run_multiseed.py                 # 三族全跑（约 15 分钟）
     python bench/run_multiseed.py --only layout   # 只跑布局族（约 4 分钟）
@@ -48,8 +51,19 @@ ARCH_VARIANTS = [
     ("全注意力 (MLA)", dict(hybrid_ratio=0)),
     ("全 GDN (无注意力)", dict(hybrid_ratio=10 ** 6)),
 ]
-LAYOUT_VARIANTS = [("interleave", {}), ("edge", dict(layout="edge"))]
+# B2 两条等参数量布局：均 2 注意力 + 4 GDN，且注意力层落在 MoE 位置（1/3/5）的
+# 个数一致（各 1 个）⇒ 参数量严格相等，只比较空间排布本身（G27 修复的混杂）。
+LAYOUT_VARIANTS = [
+    ("interleave", dict(layers=["gdn", "attn", "gdn", "gdn", "attn", "gdn"])),
+    ("edge", dict(layers=["attn", "gdn", "gdn", "gdn", "gdn", "attn"])),
+]
 OPT_VARIANTS = [("adamw", 3e-3), ("muon", 0.03), ("muon2", 0.03)]
+
+
+def _assert_layout_equal_params(rows):
+    ps = {r["name"]: r["params"] for r in rows}
+    assert len(set(ps.values())) == 1, (
+        f"B2 两布局参数量不等（layout 对比必须等参数）：{ps}")
 
 
 def _run_variant(name, kw, opt_kind, lr, seeds, steps):
@@ -85,8 +99,10 @@ def family_architecture(seeds, steps):
 
 
 def family_layout(seeds, steps):
-    return [_run_variant(f"layout={n}", k, "muon2", 0.03, seeds, steps)
+    rows = [_run_variant(f"layout={n}", k, "muon2", 0.03, seeds, steps)
             for n, k in LAYOUT_VARIANTS]
+    _assert_layout_equal_params(rows)
+    return rows
 
 
 def family_optimizer(seeds, steps):

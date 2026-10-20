@@ -61,6 +61,7 @@ class TianjiConfig:
     n_kv_heads: int = 2              # GQA（仅 mla=False 时使用）
     hybrid_ratio: int = 3            # 每 (ratio+1) 层中 ratio 层是 GDN
     layout: str = "interleave"       # "interleave" | "edge"
+    layers: list[str] | None = None  # 显式层列表覆盖（["attn"/"gdn"]*n_layers）；\n                                        # None 时由 hybrid_ratio+layout 推导（B1/B2 默认路径）
     mla: bool = True                 # 全注意力层用 MLA（否则 GQA + RoPE）
     d_latent_q: int = 48             # MLA query 压缩维
     d_latent_kv: int = 32            # MLA KV 低秩压缩维（远小于 H·d_head）
@@ -88,8 +89,20 @@ class TianjiConfig:
         return self.n_heads * self.d_head
 
 
-def build_layer_layout(n_layers: int, ratio: int = 3, layout: str = "interleave") -> list[str]:
-    """返回每层 mixer 类型（"gdn" / "attn"）。"""
+def build_layer_layout(n_layers: int, ratio: int = 3, layout: str = "interleave",
+                       layers: list[str] | None = None) -> list[str]:
+    """返回每层 mixer 类型（"gdn" / "attn"）。
+
+    layers 显式给出时直接校验返回（B2 用它构造两条等参数量布局，
+    避免默认推导在 n_layers 不整除 ratio+1 时两种 layout 注意力层数漂移）。
+    """
+    if layers is not None:
+        if len(layers) != n_layers:
+            raise ValueError(f"layers 长度 {len(layers)} != n_layers {n_layers}")
+        bad = set(layers) - {"attn", "gdn"}
+        if bad:
+            raise ValueError(f"layers 只能含 attn/gdn，非法元素：{bad}")
+        return list(layers)
     n_attn = max(1, int(round(n_layers / (ratio + 1))))
     if layout == "interleave":
         attn_idx = {(i + 1) * (ratio + 1) - 1 for i in range(n_attn)}
@@ -122,7 +135,7 @@ def init_params(cfg: TianjiConfig, seed: int = 0) -> dict[str, np.ndarray]:
 
     resid = 1.0 / np.sqrt(2 * cfg.n_layers)
     P["tok_emb"] = w((cfg.vocab_size, d), 0.02)
-    layers = build_layer_layout(cfg.n_layers, cfg.hybrid_ratio, cfg.layout)
+    layers = build_layer_layout(cfg.n_layers, cfg.hybrid_ratio, cfg.layout, cfg.layers)
 
     for i, kind in enumerate(layers):
         p = f"L{i}."
@@ -193,7 +206,7 @@ class TianjiModel:
                  seed: int = 0):
         self.cfg = cfg
         self.P = params if params is not None else init_params(cfg, seed)
-        self.layers = build_layer_layout(cfg.n_layers, cfg.hybrid_ratio, cfg.layout)
+        self.layers = build_layer_layout(cfg.n_layers, cfg.hybrid_ratio, cfg.layout, cfg.layers)
         rope_dim = cfg.d_rope if cfg.mla else cfg.d_head
         self.cos, self.sin = rope_tables(rope_dim, cfg.max_len, cfg.rope_base)
         self.moe = MoELayer(cfg.n_experts, cfg.moe_top_k, cfg.shared_expert)

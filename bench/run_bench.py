@@ -126,14 +126,31 @@ def bench_architecture(steps, seed):
 
 def bench_layout(steps, seed):
     tok, val = markov_train_val(6000, 1500, 64, seed)
+    # 两条等参数量布局：均 2 注意力 + 4 GDN，且注意力层落在 MoE 位置（1/3/5）的
+    # 个数一致（各 1 个），故 FFN/MoE 混合结构也逐层相同 ⇒ 参数量严格相等。
+    # 这样 B2 才只比较「空间排布」本身，不混杂「注意力层数」这一变量。
+    #   interleave（Qwen3-Next）：注意力散布于中部 [1,4]
+    #   edge（Mamba-3）        ：注意力集中在两端   [0,5]
+    layouts = {
+        "interleave": ["gdn", "attn", "gdn", "gdn", "attn", "gdn"],
+        "edge":       ["attn", "gdn", "gdn", "gdn", "gdn", "attn"],
+    }
     rows = []
-    for lay in ("interleave", "edge"):
-        cfg = base_cfg(layout=lay)
+    params_seen = {}
+    for lay, lst in layouts.items():
+        cfg = base_cfg(layers=lst)
         r = run_train(cfg, tok, val, steps, seed)
         r["name"] = f"layout={lay}"
         r["layout"] = lay
+        r["layers_list"] = lst
+        params_seen[lay] = r["params"]
         rows.append(r)
-        print(f"  layout={lay:<16} loss={r['final_loss']:.4f} val={r['val_loss']:.4f}", flush=True)
+        print(f"  layout={lay:<16} loss={r['final_loss']:.4f} val={r['val_loss']:.4f} "
+              f"params={r['params']}", flush=True)
+    # 硬断言：两布局参数量必须相等，否则本对比不成立（G27 修复的混杂）
+    assert params_seen["interleave"] == params_seen["edge"], (
+        f"B2 两布局参数量不等：interleave={params_seen['interleave']} "
+        f"edge={params_seen['edge']}（layout 对比必须等参数，否则混杂注意力层数）")
     return rows
 
 
